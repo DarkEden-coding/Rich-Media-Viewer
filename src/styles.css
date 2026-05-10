@@ -29,23 +29,17 @@ button, input, select { font: inherit; }
 button { cursor: pointer; }
 
 .app-shell {
-  min-height: 100vh;
+  min-height: 100dvh;
   color: #eef3fb;
   background:
     radial-gradient(circle at 78% 6%, rgba(36, 118, 255, .12), transparent 22%),
     radial-gradient(circle at 20% 17%, rgba(64, 156, 255, .08), transparent 26%),
     linear-gradient(135deg, #0c121a 0%, #05080d 42%, #080c13 100%);
-  border: 1px solid rgba(148, 163, 184, .28);
-  border-radius: 14px;
+  border: 1px solid rgba(148, 163, 184, .22);
+  border-radius: 10px;
   overflow: hidden;
-  box-shadow: inset 0 1px rgba(255,255,255,.04), 0 30px 80px rgba(0,0,0,.45);
+  box-shadow: inset 0 1px rgba(255,255,255,.04), 0 18px 48px rgba(0,0,0,.38);
 }
-
-.traffic-lights { display: flex; gap: 12px; padding: 11px 14px 0; height: 35px; }
-.traffic-lights span { width: 15px; height: 15px; border-radius: 50%; box-shadow: inset 0 -1px 2px rgba(0,0,0,.28); }
-.traffic-lights span:nth-child(1) { background: #ff5f57; }
-.traffic-lights span:nth-child(2) { background: #febc2e; }
-.traffic-lights span:nth-child(3) { background: #28c840; }
 
 .glass-panel {
   border: 1px solid rgba(148, 163, 184, .18);
@@ -95,7 +89,7 @@ button { cursor: pointer; }
 }
 
 .stat-card {
-  min-height: 128px;
+  min-height: 118px;
   border: 1px solid rgba(148, 163, 184, .19);
   border-radius: 10px;
   background: linear-gradient(145deg, rgba(31, 39, 51, .72), rgba(12, 17, 25, .76));
@@ -105,8 +99,8 @@ button { cursor: pointer; }
 .divider-line { border-top: 1px solid rgba(148,163,184,.10); }
 
 .empty-orb {
-  width: 172px;
-  height: 172px;
+  width: 148px;
+  height: 148px;
   border: 1px dashed rgba(148, 163, 184, .38);
   border-radius: 999px;
   display: grid;
