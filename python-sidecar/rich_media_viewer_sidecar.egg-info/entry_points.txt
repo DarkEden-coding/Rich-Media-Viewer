@@ -1,0 +1,2 @@
+[console_scripts]
+rich-media-sidecar = rich_media_sidecar.__main__:main
