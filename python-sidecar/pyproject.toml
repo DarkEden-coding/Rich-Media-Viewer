@@ -5,12 +5,12 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "rich-media-viewer-sidecar"
 version = "0.1.0"
-description = "Prototype Python sidecar for Rich Media Viewer provider abstractions and local clustering skeleton."
+description = "Python sidecar for Rich Media Viewer local embeddings, face detection/clustering, and remote provider stubs."
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "UNLICENSED" }
 authors = [{ name = "Rich Media Viewer contributors" }]
-dependencies = []
+dependencies = ["numpy>=1.24", "Pillow>=10.0", "opencv-python-headless>=4.8"]
 
 [project.scripts]
 rich-media-sidecar = "rich_media_sidecar.__main__:main"

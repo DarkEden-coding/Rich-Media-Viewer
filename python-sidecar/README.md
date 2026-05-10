@@ -1,75 +1,68 @@
 # Rich Media Viewer Python Sidecar
 
-This directory contains a **prototype Python sidecar** for future media intelligence features in Rich Media Viewer. It is intentionally isolated from the frontend (`src/`) and Rust/Tauri backend (`src-tauri/`) so it can evolve independently.
+Local-first JSON CLI for media intelligence. It does not touch the Tauri/Rust or frontend code.
 
-## Current status
+## Features
 
-The implementation is a skeleton with safe placeholder behavior:
-
-- Local face clustering is represented by deterministic stub logic.
-- Embedding providers expose a common abstraction for:
-  - `local` placeholder embeddings
-  - `google` placeholder provider
-  - `openrouter` placeholder provider
-- No image bytes are uploaded anywhere by default.
-- Cloud providers currently require explicit consent flags and still return placeholder embeddings unless future integration code is added.
-
-## Privacy and consent model
-
-Media libraries can contain sensitive biometric data. Future production use should follow these rules:
-
-1. Prefer local processing for face detection, embeddings, and clustering.
-2. Require explicit opt-in before sending any image, face crop, metadata, or embedding to a third-party provider.
-3. Clearly display which provider is used and what data leaves the device.
-4. Avoid storing raw face crops unless the user enables that behavior.
-5. Treat face embeddings as sensitive biometric-derived data.
-
-The current CLI enforces a conservative model: cloud provider classes reject calls unless `allow_remote=True` is passed.
+- Robust JSON responses: success is `{"ok":true,"data":...}`; errors are `{"ok":false,"error":{"code", "message"}}` on stderr.
+- Local embeddings:
+  - images: deterministic Pillow/numpy color, histogram, thumbnail, and gradient features
+  - text: deterministic hashing-vector embedding
+  - videos/other paths: deterministic metadata/path fallback (no ffmpeg required)
+- Local face detection and clustering:
+  - OpenCV Haar cascade face boxes when `opencv-python-headless` is available
+  - deterministic face embeddings from cropped pixels
+  - simple DBSCAN-like online cosine clustering
+- Remote provider stubs for Google and OpenRouter:
+  - require `--allow-remote`
+  - require `GOOGLE_API_KEY` or `OPENROUTER_API_KEY`
+  - contain real HTTP endpoint structure, but current path embedding does **not** upload media bytes
 
 ## Install
 
-From this directory:
-
 ```bash
+cd python-sidecar
 python -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-No heavy ML dependencies are required yet.
+## CLI
 
-## CLI usage
-
-Show help:
+Embed paths and/or text:
 
 ```bash
-python -m rich_media_sidecar --help
+python -m rich_media_sidecar embed /path/a.jpg /path/video.mp4 --text "beach sunset"
 ```
 
-Generate placeholder embeddings for files:
+JSON request form:
 
 ```bash
-python -m rich_media_sidecar embed --provider local /path/to/image1.jpg /path/to/image2.jpg
+python -m rich_media_sidecar embed --json '{"paths":["/path/a.jpg"],"texts":["cat"]}'
 ```
 
-Run placeholder clustering:
+Cluster faces:
 
 ```bash
-python -m rich_media_sidecar cluster /path/to/image1.jpg /path/to/image2.jpg
+python -m rich_media_sidecar cluster-faces /path/a.jpg /path/b.jpg --threshold 0.88
 ```
 
-Try a remote provider stub with explicit consent:
+Output face records include `path`, `bbox` (`[x,y,width,height]`), `cluster_id`, and `embedding`.
+
+Semantic search over prior embeddings:
 
 ```bash
-python -m rich_media_sidecar embed --provider openrouter --allow-remote /path/to/image.jpg
+python -m rich_media_sidecar semantic-search --query "red car" --vectors embeddings.json
 ```
 
-## Future Tauri integration
+Remote stubs:
 
-A future Rust backend can launch this sidecar as a subprocess and communicate using JSON over stdin/stdout or command arguments. Recommended next steps:
+```bash
+OPENROUTER_API_KEY=... python -m rich_media_sidecar embed --provider openrouter --allow-remote --text "hello"
+```
 
-- Define a stable JSON-RPC-like protocol for requests and responses.
-- Package the sidecar with the Tauri app bundle.
-- Add local model support for face detection and embedding extraction.
-- Add secure user settings for provider choice and consent.
-- Add integration tests that exercise CLI behavior without requiring cloud credentials.
+Without `--allow-remote`, remote providers return a JSON error and make no request.
+
+## Privacy
+
+Default processing is local. Face embeddings are biometric-derived data; store and transmit them only with explicit user consent.
