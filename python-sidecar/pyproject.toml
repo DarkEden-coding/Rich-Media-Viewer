@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "rich-media-viewer-sidecar"
+version = "0.1.0"
+description = "Prototype Python sidecar for Rich Media Viewer provider abstractions and local clustering skeleton."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "UNLICENSED" }
+authors = [{ name = "Rich Media Viewer contributors" }]
+dependencies = []
+
+[project.scripts]
+rich-media-sidecar = "rich_media_sidecar.__main__:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["rich_media_sidecar*"]

@@ -1,0 +1,4 @@
+# Runtime dependencies for the Python sidecar prototype.
+# Keep this lightweight until concrete ML/provider integrations are added.
+
+# No required third-party dependencies yet.
