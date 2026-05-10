@@ -1,18 +1,32 @@
 # Python Sidecar Architecture Notes
 
-The Python sidecar lives under `python-sidecar/` and is currently a standalone prototype. It is not wired into the Tauri/Rust backend or frontend yet.
+The Python sidecar lives under `python-sidecar/` and is invoked by the Rust/Tauri backend in development.
 
 ## Responsibilities
 
-- Define a provider abstraction for embeddings.
-- Keep local processing as the default path.
-- Provide explicit consent gates for future remote providers.
-- Offer a CLI that can later be launched by Tauri as a subprocess.
+- Local-first media intelligence.
+- OpenCV Haar face detection and deterministic face-embedding clustering.
+- Local deterministic image/text/video embeddings.
+- Remote provider interfaces for Google/OpenRouter-style calls, gated by explicit consent.
+- JSON CLI protocol for Rust subprocess integration.
 
-## Placeholder behavior
+## Commands
 
-All providers currently generate deterministic pseudo-embeddings from path strings. The sidecar does not read image bytes, detect faces, cluster real identities, or call network APIs.
+- `python3 -m rich_media_sidecar embed --provider local --text "query"`
+- `python3 -m rich_media_sidecar embed --provider local /path/to/image.jpg`
+- `python3 -m rich_media_sidecar cluster-faces /path/to/image.jpg`
+- `python3 -m rich_media_sidecar semantic-search --query "beach" --vectors '[...]'`
 
-## Integration direction
+Rust commands currently call the sidecar for:
 
-Future integration should use a stable JSON protocol between Rust and Python, with user-visible settings for provider choice and cloud consent. Face embeddings should be handled as sensitive biometric-derived data.
+- `cluster_faces`
+- `generate_embeddings`
+- `search_semantic_text`
+
+## Privacy
+
+Face recognition is local only. Remote embedding providers refuse to run unless the app passes explicit `allow_remote` consent.
+
+## Packaging
+
+Development resolves the sidecar from the repository root. Production bundling still needs Python/runtime resource packaging for macOS and Windows installers.

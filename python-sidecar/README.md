@@ -1,6 +1,6 @@
 # Rich Media Viewer Python Sidecar
 
-Local-first JSON CLI for media intelligence. It does not touch the Tauri/Rust or frontend code.
+Local-first JSON CLI for media intelligence. In development it is invoked by the Tauri/Rust backend for face clustering, embedding generation, and semantic text search.
 
 ## Features
 
