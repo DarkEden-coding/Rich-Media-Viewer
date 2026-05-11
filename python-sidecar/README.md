@@ -1,22 +1,22 @@
 # Rich Media Viewer Python Sidecar
 
-Local-first JSON CLI for media intelligence. In development it is invoked by the Tauri/Rust backend for face clustering, embedding generation, and semantic text search.
+JSON CLI for media intelligence. In development it is invoked by the Tauri/Rust backend for face clustering, embedding generation, and semantic text search.
 
 ## Features
 
 - Robust JSON responses: success is `{"ok":true,"data":...}`; errors are `{"ok":false,"error":{"code", "message"}}` on stderr.
-- Local embeddings:
-  - images: deterministic Pillow/numpy color, histogram, thumbnail, and gradient features
-  - text: deterministic hashing-vector embedding
-  - videos/other paths: deterministic metadata/path fallback (no ffmpeg required)
+- Embedding providers:
+  - Ollama local text embeddings through `/api/embed`
+  - Google Gemini embeddings through `models.embedContent`
+  - OpenRouter embeddings through its OpenAI-compatible `/embeddings` endpoint
 - Local face detection and clustering:
   - OpenCV Haar cascade face boxes when `opencv-python-headless` is available
   - deterministic face embeddings from cropped pixels
   - simple DBSCAN-like online cosine clustering
-- Remote provider stubs for Google and OpenRouter:
-  - require `--allow-remote`
-  - require `GOOGLE_API_KEY` or `OPENROUTER_API_KEY`
-  - contain real HTTP endpoint structure, but current path embedding does **not** upload media bytes
+- Capability-aware media embedding:
+  - Google `gemini-embedding-2` sends supported image, video, audio, and PDF bytes to Gemini
+  - OpenRouter `google/gemini-embedding-2-preview` sends supported image bytes through OpenRouter's multimodal embedding input format
+  - Text-only models and unsupported media files are skipped instead of inventing proxy vectors
 
 ## Install
 
@@ -32,13 +32,13 @@ pip install -r requirements.txt
 Embed paths and/or text:
 
 ```bash
-python -m rich_media_sidecar embed /path/a.jpg /path/video.mp4 --text "beach sunset"
+python -m rich_media_sidecar embed --provider google --model gemini-embedding-2 /path/a.jpg /path/video.mp4 --text "beach sunset"
 ```
 
 JSON request form:
 
 ```bash
-python -m rich_media_sidecar embed --json '{"paths":["/path/a.jpg"],"texts":["cat"]}'
+python -m rich_media_sidecar embed --provider ollama --model nomic-embed-text --json '{"texts":["cat"]}'
 ```
 
 Cluster faces:
@@ -55,14 +55,12 @@ Semantic search over prior embeddings:
 python -m rich_media_sidecar semantic-search --query "red car" --vectors embeddings.json
 ```
 
-Remote stubs:
+OpenRouter text embeddings:
 
 ```bash
-OPENROUTER_API_KEY=... python -m rich_media_sidecar embed --provider openrouter --allow-remote --text "hello"
+OPENROUTER_API_KEY=... python -m rich_media_sidecar embed --provider openrouter --model google/gemini-embedding-2-preview /path/a.jpg --text "hello"
 ```
-
-Without `--allow-remote`, remote providers return a JSON error and make no request.
 
 ## Privacy
 
-Default processing is local. Face embeddings are biometric-derived data; store and transmit them only with explicit user consent.
+Face embeddings are biometric-derived data and remain local. Google and OpenRouter embedding providers send selected query text and supported media inputs to their APIs when configured.

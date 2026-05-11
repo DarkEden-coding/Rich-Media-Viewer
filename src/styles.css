@@ -58,6 +58,10 @@ button { cursor: pointer; }
   padding: 11px 13px;
   box-shadow: inset 0 1px 4px rgba(0,0,0,.38);
 }
+.select-field option {
+  background-color: #0b1018; /* Dark background to contrast with the light text */
+  color: #e7edf7; /* Light text for readability */
+}
 .field::placeholder { color: #9aa4b2; }
 .field:focus, .select-field:focus { border-color: rgba(45, 142, 255, .78); box-shadow: 0 0 0 3px rgba(45,142,255,.12), inset 0 1px 4px rgba(0,0,0,.38); }
 
@@ -97,6 +101,42 @@ button { cursor: pointer; }
 }
 
 .divider-line { border-top: 1px solid rgba(148,163,184,.10); }
+
+.media-card {
+  content-visibility: auto;
+  contain-intrinsic-size: 260px 230px;
+}
+
+.thumb-placeholder::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  background:
+    linear-gradient(110deg, transparent 0%, rgba(255,255,255,.08) 45%, transparent 70%),
+    linear-gradient(145deg, rgba(30,41,59,.9), rgba(15,23,42,.95));
+  background-size: 220% 100%, 100% 100%;
+  animation: thumb-shimmer 1.3s ease-in-out infinite;
+}
+
+@keyframes thumb-shimmer {
+  from { background-position: 180% 0, 0 0; }
+  to { background-position: -80% 0, 0 0; }
+}
+
+.custom-scrollbar::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+.custom-scrollbar::-webkit-scrollbar-track {
+  background: transparent;
+}
+.custom-scrollbar::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.1);
+  border-radius: 4px;
+}
+.custom-scrollbar::-webkit-scrollbar-thumb:hover {
+  background: rgba(255, 255, 255, 0.2);
+}
 
 .empty-orb {
   width: 148px;

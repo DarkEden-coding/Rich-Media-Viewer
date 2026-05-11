@@ -1,16 +1,35 @@
 import { convertFileSrc, invoke } from '@tauri-apps/api/core';
-import { useEffect, useMemo, useState } from 'react';
+import { listen } from '@tauri-apps/api/event';
+import { memo, startTransition, useEffect, useMemo, useRef, useState, type UIEvent } from 'react';
 
 type AppInfo = { data_dir: string; database_path: string };
 type MediaItem = { id:number; path:string; file_name:string; extension:string|null; media_type:string; size_bytes:number|null; created_at:number|null; modified_at:number|null; imported_at:number; missing:boolean; camera_make:string|null; camera_model:string|null; lens_model:string|null; captured_at:number|null; latitude:number|null; longitude:number|null; metadata_json:string|null };
 type ScanSummary = { scanned_files:number; imported_or_updated:number; skipped_files:number; missing_marked:number; errors:string[] };
+type ScanProgress = { phase:string; current_path:string|null; scanned_files:number; imported_or_updated:number; skipped_files:number; missing_marked:number; errors:number; discovered_files?:number; total_files?:number|null; done:boolean };
 type Person = { id:number; name:string; created_at:number; face_count:number };
 type SidecarResult = { ok:boolean; stdout:string; stderr:string };
+type Face = { id:number; media_item_id:number; person_id:number|null; person_name:string|null; x:number; y:number; width:number; height:number; confidence:number|null; created_at:number };
 type ViewMode = 'grid' | 'list';
 
 const emptyFilters = { query:'', mediaType:'', missing:'', from:'', to:'', lat:'', lng:'', radius:'', camera:'', personId:'', personName:'', hasGps:'', hasCamera:'' };
-const icons = { folder:'▱', search:'⌕', image:'▧', video:'▻', missing:'?', box:'▱', grid:'▦', list:'☷' };
-const providers = ['local', 'google', 'openrouter'];
+const icons = {
+  folder: <svg xmlns="http://www.w3.org/2000/svg" width="1em" height="1em" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M4 20h16a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.93a2 2 0 0 1-1.66-.9l-.82-1.2A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13c0 1.1.9 2 2 2Z"/></svg>,
+  search: <svg xmlns="http://www.w3.org/2000/svg" width="1em" height="1em" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3"/></svg>,
+  image: <svg xmlns="http://www.w3.org/2000/svg" width="1em" height="1em" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><rect width="18" height="18" x="3" y="3" rx="2" ry="2"/><circle cx="9" cy="9" r="2"/><path d="m21 15-3.086-3.086a2 2 0 0 0-2.828 0L6 21"/></svg>,
+  video: <svg xmlns="http://www.w3.org/2000/svg" width="1em" height="1em" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="m22 8-6 4 6 4V8Z"/><rect width="14" height="12" x="2" y="6" rx="2" ry="2"/></svg>,
+  missing: <svg xmlns="http://www.w3.org/2000/svg" width="1em" height="1em" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="10"/><line x1="12" x2="12" y1="8" y2="12"/><line x1="12" x2="12.01" y1="16" y2="16"/></svg>,
+  box: <svg xmlns="http://www.w3.org/2000/svg" width="1em" height="1em" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M21 8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16Z"/><path d="m3.3 7 8.7 5 8.7-5"/><path d="M12 22V12"/></svg>,
+  grid: <svg xmlns="http://www.w3.org/2000/svg" width="1em" height="1em" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><rect width="7" height="7" x="3" y="3" rx="1"/><rect width="7" height="7" x="14" y="3" rx="1"/><rect width="7" height="7" x="14" y="14" rx="1"/><rect width="7" height="7" x="3" y="14" rx="1"/></svg>,
+  list: <svg xmlns="http://www.w3.org/2000/svg" width="1em" height="1em" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><line x1="8" x2="21" y1="6" y2="6"/><line x1="8" x2="21" y1="12" y2="12"/><line x1="8" x2="21" y1="18" y2="18"/><line x1="3" x2="3.01" y1="6" y2="6"/><line x1="3" x2="3.01" y1="12" y2="12"/><line x1="3" x2="3.01" y1="18" y2="18"/></svg>,
+  user: <svg xmlns="http://www.w3.org/2000/svg" width="1em" height="1em" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M19 21v-2a4 4 0 0 0-4-4H9a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>,
+  sparkles: <svg xmlns="http://www.w3.org/2000/svg" width="1em" height="1em" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="m12 3-1.912 5.813a2 2 0 0 1-1.275 1.275L3 12l5.813 1.912a2 2 0 0 1 1.275 1.275L12 21l1.912-5.813a2 2 0 0 1 1.275-1.275L21 12l-5.813-1.912a2 2 0 0 1-1.275-1.275L12 3Z"/><path d="M5 3v4"/><path d="M3 5h4"/></svg>
+};
+const providers = ['ollama', 'google', 'openrouter'];
+const ollamaEmbeddingModels = ['nomic-embed-text', 'mxbai-embed-large', 'snowflake-arctic-embed', 'all-minilm'];
+const googleEmbeddingModels = ['gemini-embedding-2', 'gemini-embedding-001', 'text-embedding-004'];
+const openRouterEmbeddingModels = ['google/gemini-embedding-2-preview', 'openai/text-embedding-3-small', 'openai/text-embedding-3-large'];
+const embeddingModelsByProvider: Record<string, string[]> = { ollama: ollamaEmbeddingModels, google: googleEmbeddingModels, openrouter: openRouterEmbeddingModels };
+const PAGE_SIZE = 120;
 
 function formatBytes(bytes?: number | null) { if (!bytes) return '—'; const units = ['B','KB','MB','GB','TB']; let size = bytes, unit = 0; while (size >= 1024 && unit < units.length - 1) { size /= 1024; unit++; } return `${size.toFixed(unit ? 1 : 0)} ${units[unit]}`; }
 function formatDate(seconds?: number | null) { return seconds ? new Date(seconds * 1000).toLocaleString() : 'Unknown'; }
@@ -18,23 +37,64 @@ function mediaUrl(item: MediaItem) { try { return convertFileSrc(item.path); } c
 function dateToEpoch(value: string, end = false) { if (!value) return undefined; const d = new Date(`${value}T${end ? '23:59:59' : '00:00:00'}`); return Number.isNaN(d.getTime()) ? undefined : Math.floor(d.getTime() / 1000); }
 function num(value: string) { const n = Number(value); return value.trim() === '' || Number.isNaN(n) ? undefined : n; }
 function metaRows(item: MediaItem) { return [['Captured', formatDate(item.captured_at)], ['Created', formatDate(item.created_at)], ['Modified', formatDate(item.modified_at)], ['Camera', `${item.camera_make ?? ''} ${item.camera_model ?? ''}`.trim() || '—'], ['Lens', item.lens_model ?? '—'], ['GPS', item.latitude != null && item.longitude != null ? `${item.latitude.toFixed(5)}, ${item.longitude.toFixed(5)}` : '—']]; }
+function scanPercent(p: ScanProgress) { return p.total_files ? Math.min(100, Math.max(0, (p.scanned_files / p.total_files) * 100)) : 0; }
+
+const LazyMediaThumb = memo(function LazyMediaThumb({ item, view }: { item: MediaItem; view: ViewMode }) {
+  const [shouldLoad, setShouldLoad] = useState(false);
+  const [loaded, setLoaded] = useState(false);
+  const holderRef = useRef<HTMLDivElement | null>(null);
+
+  useEffect(() => {
+    setShouldLoad(false);
+    setLoaded(false);
+    const node = holderRef.current;
+    if (!node) return;
+    if (!('IntersectionObserver' in window)) { setShouldLoad(true); return; }
+    const observer = new IntersectionObserver(entries => {
+      if (entries.some(entry => entry.isIntersecting)) {
+        setShouldLoad(true);
+        observer.disconnect();
+      }
+    }, { rootMargin: '650px 0px' });
+    observer.observe(node);
+    return () => observer.disconnect();
+  }, [item.id]);
+
+  const sizeClass = view === 'grid' ? 'h-44 w-full' : 'h-20 w-28 shrink-0 rounded-xl';
+  if (item.media_type !== 'image') return <div className={`${view === 'grid' ? 'flex h-44' : 'flex h-20 w-28 shrink-0'} items-center justify-center rounded-xl bg-slate-800`}>▶</div>;
+
+  return <div ref={holderRef} className={`thumb-placeholder relative overflow-hidden bg-slate-800 ${sizeClass}`}>
+    {shouldLoad && <img src={mediaUrl(item)} loading="lazy" decoding="async" fetchPriority="low" onLoad={() => setLoaded(true)} className={`absolute inset-0 h-full w-full object-cover transition-opacity duration-200 ${loaded ? 'opacity-100' : 'opacity-0'}`} />}
+  </div>;
+});
 
 function App() {
   const [appInfo, setAppInfo] = useState<AppInfo | null>(null);
   const [setupOpen, setSetupOpen] = useState(true);
   const [folderInput, setFolderInput] = useState('');
   const [folders, setFolders] = useState<string[]>([]);
-  const [provider, setProvider] = useState(localStorage.getItem('rmv.provider') || 'local');
-  const [allowRemote, setAllowRemote] = useState(localStorage.getItem('rmv.allowRemote') === 'true');
+  const [provider, setProvider] = useState(providers.includes(localStorage.getItem('rmv.provider') || '') ? localStorage.getItem('rmv.provider')! : 'ollama');
+  const [embeddingModel, setEmbeddingModel] = useState(localStorage.getItem('rmv.embeddingModel') || (embeddingModelsByProvider[provider]?.[0] ?? 'nomic-embed-text'));
   const [filters, setFilters] = useState(emptyFilters);
   const [people, setPeople] = useState<Person[]>([]);
   const [items, setItems] = useState<MediaItem[]>([]);
+  const [hasMoreItems, setHasMoreItems] = useState(true);
   const [selected, setSelected] = useState<MediaItem | null>(null);
   const [view, setView] = useState<ViewMode>('grid');
   const [loading, setLoading] = useState(false);
   const [scan, setScan] = useState<ScanSummary | null>(null);
+  const [scanProgress, setScanProgress] = useState<ScanProgress | null>(null);
   const [notice, setNotice] = useState('Starting Rich Media Viewer…');
   const [rename, setRename] = useState<Record<number,string>>({});
+  const [faceSetupOpen, setFaceSetupOpen] = useState(false);
+  const [faceItems, setFaceItems] = useState<MediaItem[]>([]);
+  const [faceIndex, setFaceIndex] = useState(0);
+  const [faces, setFaces] = useState<Face[]>([]);
+  const [faceNames, setFaceNames] = useState<Record<number,string>>({});
+  const [faceBusy, setFaceBusy] = useState(false);
+  const scrollerRef = useRef<HTMLDivElement | null>(null);
+  const scrollRafRef = useRef<number | null>(null);
+  const [scrollMetrics, setScrollMetrics] = useState({ top: 0, height: 1, width: 1 });
 
   const counts = useMemo(() => ({ total: items.length, images: items.filter(i => i.media_type === 'image').length, videos: items.filter(i => i.media_type === 'video').length, missing: items.filter(i => i.missing).length }), [items]);
   const updateFilter = (key: keyof typeof emptyFilters, value: string) => setFilters(f => ({ ...f, [key]: value }));
@@ -42,34 +102,213 @@ function App() {
 
   async function loadSettings() { const s = await invoke<{library_folders:string[]}>('get_settings'); setFolders(s.library_folders || []); }
   async function loadPeople() { try { const p = await invoke<Person[]>('list_people'); setPeople(p); setRename(Object.fromEntries(p.map(x => [x.id, x.name]))); } catch { /* no people yet */ } }
-  async function runSearch(next = filters) {
+  async function runSearch(next = filters, append = false) {
+    if (loading && append) return;
+    const offset = append ? items.length : 0;
     setLoading(true);
     try {
       if (next.query.trim()) {
         try {
-          const semantic = await invoke<{ item: MediaItem; score: number }[]>('search_semantic_text', { query: next.query.trim(), provider, allowRemote, limit: 120 });
-          if (semantic.length) { const result = semantic.map(hit => hit.item); setItems(result); setNotice(`Semantic search found ${result.length} embedded matches`); return; }
+          const semantic = await invoke<{ item: MediaItem; score: number }[]>('search_semantic_text', { query: next.query.trim(), provider, model: embeddingModel, limit: 120 });
+          if (semantic.length) { const result = semantic.map(hit => hit.item); setItems(result); setHasMoreItems(false); setNotice(`Semantic search found ${result.length} embedded matches`); return; }
         } catch { /* no embeddings yet or provider unavailable; continue with metadata search */ }
       }
-      const filter = { query: next.query || undefined, media_type: next.mediaType || undefined, missing: next.missing === '' ? undefined : next.missing === 'true', from_ts: dateToEpoch(next.from), to_ts: dateToEpoch(next.to, true), camera: next.camera || undefined, lat: num(next.lat), lng: num(next.lng), radius_km: num(next.radius), person_id: num(next.personId), person_name: next.personName || undefined, has_gps: next.hasGps === '' ? undefined : next.hasGps === 'true', has_camera: next.hasCamera === '' ? undefined : next.hasCamera === 'true', limit: 120, offset: 0 };
-      const result = await invoke<MediaItem[]>('search_media', { filter }); setItems(result); setNotice(`${result.length} media items loaded`);
+      const filter = { query: next.query || undefined, media_type: next.mediaType || undefined, missing: next.missing === '' ? undefined : next.missing === 'true', from_ts: dateToEpoch(next.from), to_ts: dateToEpoch(next.to, true), camera: next.camera || undefined, lat: num(next.lat), lng: num(next.lng), radius_km: num(next.radius), person_id: num(next.personId), person_name: next.personName || undefined, has_gps: next.hasGps === '' ? undefined : next.hasGps === 'true', has_camera: next.hasCamera === '' ? undefined : next.hasCamera === 'true', limit: PAGE_SIZE, offset };
+      const result = await invoke<MediaItem[]>('search_media', { filter }); startTransition(() => setItems(prev => append ? [...prev, ...result] : result)); setHasMoreItems(result.length === PAGE_SIZE); setNotice(`${append ? offset + result.length : result.length} media items loaded`);
     } catch (error) { setNotice(`Search unavailable: ${String(error)}`); } finally { setLoading(false); }
   }
   useEffect(() => { invoke<AppInfo>('initialize_app').then(async info => { setAppInfo(info); await loadSettings(); await loadPeople(); await runSearch(); setNotice('Library database ready'); }).catch(e => setNotice(`Running in preview mode: ${String(e)}`)); /* eslint-disable-next-line react-hooks/exhaustive-deps */ }, []);
-  useEffect(() => { localStorage.setItem('rmv.provider', provider); localStorage.setItem('rmv.allowRemote', String(allowRemote)); }, [provider, allowRemote]);
+  useEffect(() => { const unlisten = listen<ScanProgress>('scan-progress', e => { setScanProgress(e.payload); setNotice(`${e.payload.phase}: ${e.payload.scanned_files} scanned, ${e.payload.imported_or_updated} imported`); }); return () => { unlisten.then(f => f()); }; }, []);
+  useEffect(() => { localStorage.setItem('rmv.provider', provider); }, [provider]);
+  useEffect(() => { localStorage.setItem('rmv.embeddingModel', embeddingModel); }, [embeddingModel]);
+  useEffect(() => {
+    const models = embeddingModelsByProvider[provider] ?? [];
+    if (models.length && !models.includes(embeddingModel)) setEmbeddingModel(models[0]);
+  }, [provider, embeddingModel]);
+  useEffect(() => {
+    const el = scrollerRef.current;
+    if (!el) return;
+    const update = () => setScrollMetrics({ top: el.scrollTop, height: el.clientHeight, width: el.clientWidth });
+    update();
+    const observer = new ResizeObserver(update);
+    observer.observe(el);
+    return () => observer.disconnect();
+  }, [view]);
 
   async function addFolder(path = folderInput.trim()) { if (!path) return; const list = await invoke<string[]>('add_library_folder', { path }); setFolders(list); setFolderInput(''); await invoke('update_settings', { settings: { library_folders: list } }); }
   async function chooseFolder() { const path = await invoke<string | null>('choose_media_folder', { path: null }); if (path) await addFolder(path); }
   async function removeFolder(path: string) { const list = await invoke<string[]>('remove_library_folder', { path }); setFolders(list); await invoke('update_settings', { settings: { library_folders: list } }); }
-  async function scanFolders(paths = folders) { if (!paths.length) return setNotice('Add at least one folder path before scanning.'); setLoading(true); setNotice('Scanning library…'); try { const summary = await invoke<ScanSummary>('scan_library', { paths }); setScan(summary); setSetupOpen(false); setNotice(`Scan complete: ${summary.imported_or_updated} imported/updated`); await runSearch(); } catch (e) { setNotice(`Scan failed: ${String(e)}`); } finally { setLoading(false); } }
+  async function scanFolders(paths = folders) { if (!paths.length) return setNotice('Add at least one folder path before scanning.'); setLoading(true); setScanProgress({ phase:'Starting scan', current_path:null, scanned_files:0, imported_or_updated:0, skipped_files:0, missing_marked:0, errors:0, discovered_files:0, total_files:null, done:false }); setNotice('Scanning library…'); try { const summary = await invoke<ScanSummary>('scan_library', { paths }); setScan(summary); setSetupOpen(false); setNotice(`Scan complete: ${summary.imported_or_updated} imported/updated`); await runSearch(); } catch (e) { setNotice(`Scan failed: ${String(e)}`); } finally { setLoading(false); } }
+  async function deleteIndex() {
+    if (!confirm('Delete the current Rich Media Viewer index database? This removes indexed media records, people/faces, embeddings, and saved folder settings. Original media files will not be deleted.')) return;
+    setLoading(true);
+    try { const info = await invoke<AppInfo>('delete_current_index'); setAppInfo(info); setFolders([]); setItems([]); setPeople([]); setFaces([]); setFaceItems([]); setSelected(null); setScan(null); setScanProgress(null); setHasMoreItems(false); setNotice('Index database deleted. Add folders and scan to rebuild it.'); }
+    catch (e) { setNotice(`Delete index failed: ${String(e)}`); }
+    finally { setLoading(false); }
+  }
   async function openItem(item: MediaItem) { setSelected(item); try { setSelected((await invoke<MediaItem | null>('get_media_item', { id: item.id })) ?? item); } catch { /* keep optimistic item */ } }
   async function renamePerson(id: number) { await invoke('rename_person', { personId: id, name: rename[id] || 'Unnamed' }); await loadPeople(); await runSearch(); }
-  async function sidecar(cmd: 'cluster_faces'|'generate_embeddings') { setLoading(true); try { const res = cmd === 'cluster_faces' ? await invoke<SidecarResult>(cmd, { mediaIds: null }) : await invoke<SidecarResult>(cmd, { mediaIds: null, provider, allowRemote }); setNotice(`${cmd}: ${res.ok ? 'complete' : 'failed'} ${res.stderr || res.stdout}`); await loadPeople(); } catch (e) { setNotice(`${cmd} failed: ${String(e)}`); } finally { setLoading(false); } }
+  async function sidecar(cmd: 'generate_embeddings') { setLoading(true); try { const res = await invoke<SidecarResult>(cmd, { mediaIds: null, provider, model: embeddingModel }); setNotice(`${cmd}: ${res.ok ? 'complete' : 'failed'} ${res.stderr || res.stdout}`); await loadPeople(); } catch (e) { setNotice(`${cmd} failed: ${String(e)}`); } finally { setLoading(false); } }
+  async function openFaceSetup() {
+    setFaceSetupOpen(true); setSetupOpen(false); setFaceBusy(true); setNotice('Guided face setup opened. Faces process one image at a time.');
+    try { const result = await invoke<MediaItem[]>('search_media', { filter: { media_type: 'image', missing: false, limit: 500, offset: 0 } }); setFaceItems(result); setFaceIndex(0); if (result[0]) await processFaceImage(result[0].id); }
+    catch (e) { setNotice(`Face setup unavailable: ${String(e)}`); }
+    finally { setFaceBusy(false); }
+  }
+  async function processFaceImage(mediaId: number) {
+    setFaceBusy(true);
+    try { await invoke<SidecarResult>('process_face_setup_image', { mediaId }); const f = await invoke<Face[]>('list_faces', { mediaItemId: mediaId, personId: null }); setFaces(f); setFaceNames(Object.fromEntries(f.map(x => [x.id, x.person_name || '']))); await loadPeople(); }
+    catch (e) { setNotice(`Face processing failed: ${String(e)}`); setFaces([]); }
+    finally { setFaceBusy(false); }
+  }
+  async function goFace(delta: number) { const next = Math.min(Math.max(faceIndex + delta, 0), faceItems.length - 1); setFaceIndex(next); const item = faceItems[next]; if (item) await processFaceImage(item.id); }
+  async function saveFaceName(faceId: number) { const name = (faceNames[faceId] || '').trim(); if (!name) return; setFaceBusy(true); try { const matched = await invoke<number>('name_face', { faceId, name }); setNotice(`Named face and matched ${matched} similar unnamed face(s).`); const item = faceItems[faceIndex]; if (item) await processFaceImage(item.id); await loadPeople(); } catch (e) { setNotice(`Naming face failed: ${String(e)}`); } finally { setFaceBusy(false); } }
+  function maybeLoadMore(e: UIEvent<HTMLDivElement>) {
+    const el = e.currentTarget;
+    if (scrollRafRef.current == null) scrollRafRef.current = requestAnimationFrame(() => { scrollRafRef.current = null; setScrollMetrics({ top: el.scrollTop, height: el.clientHeight, width: el.clientWidth }); });
+    if (hasMoreItems && !loading && el.scrollHeight - el.scrollTop - el.clientHeight < 900) void runSearch(filters, true);
+  }
 
-  return <main className="app-shell flex h-dvh min-h-0 flex-col"><div className="flex min-h-0 flex-1"><aside className="w-[min(420px,40vw)] min-w-[300px] shrink-0 px-3 pb-6 pt-4"><div className="glass-panel flex h-full min-h-0 flex-col overflow-hidden rounded-[13px]"><div className="overflow-y-auto px-6 pb-6 pt-8"><div className="flex items-baseline justify-between gap-3"><p className="text-[13px] font-black uppercase tracking-[0.42em] text-[#4da8ff]">Private library</p><span className="shrink-0 text-[11px] font-semibold uppercase tracking-[0.2em] text-slate-500">Local index</span></div><h1 className="mt-4 text-[32px] font-black leading-tight tracking-[-0.04em]">Rich Media Viewer</h1><p className="mt-3 text-[15px] leading-snug text-slate-400">Local-first media indexing with metadata, faces and embeddings.</p><button onClick={() => setSetupOpen(true)} className="mt-6 flex w-full items-center justify-between rounded-lg border border-slate-500/25 bg-slate-950/20 px-4 py-3.5 text-left text-[15px] font-extrabold hover:border-blue-400/60"><span>{icons.folder} Setup folders / providers</span><span>›</span></button>
-  <section className="glass-panel mt-5 rounded-xl p-4"><label><span className="label">Semantic / filename query</span><input value={filters.query} onChange={e => updateFilter('query', e.target.value)} placeholder="sunset beach, dog, receipt..." className="field" /></label><p className="mt-2 text-xs text-slate-400">Uses semantic vector search when embeddings exist, then falls back to filename/path matching.</p><div className="mt-5 grid grid-cols-2 gap-4"><label><span className="sub-label">From</span><input type="date" value={filters.from} onChange={e => updateFilter('from', e.target.value)} className="field" /></label><label><span className="sub-label">To</span><input type="date" value={filters.to} onChange={e => updateFilter('to', e.target.value)} className="field" /></label></div><div className="mt-5 space-y-3"><div className="grid grid-cols-2 gap-3"><input value={filters.lat} onChange={e => updateFilter('lat', e.target.value)} placeholder="Latitude" className="field min-w-0"/><input value={filters.lng} onChange={e => updateFilter('lng', e.target.value)} placeholder="Longitude" className="field min-w-0"/></div><input value={filters.radius} onChange={e => updateFilter('radius', e.target.value)} placeholder="Radius (km)" className="field w-full max-w-full"/></div><div className="mt-5 grid grid-cols-2 gap-4"><select value={filters.personId} onChange={e => updateFilter('personId', e.target.value)} className="select-field min-w-0"><option value="">All people</option>{people.map(p => <option key={p.id} value={p.id}>{p.name} ({p.face_count})</option>)}</select><input value={filters.personName} onChange={e => updateFilter('personName', e.target.value)} placeholder="Person name contains" className="field min-w-0" /></div><div className="mt-5 grid grid-cols-2 gap-4"><select value={filters.mediaType} onChange={e => updateFilter('mediaType', e.target.value)} className="select-field min-w-0"><option value="">All media</option><option value="image">Images</option><option value="video">Videos</option></select><select value={filters.missing} onChange={e => updateFilter('missing', e.target.value)} className="select-field min-w-0"><option value="">Any status</option><option value="false">Available</option><option value="true">Missing</option></select></div><div className="mt-5 grid grid-cols-1 gap-3 sm:grid-cols-3"><input value={filters.camera} onChange={e => updateFilter('camera', e.target.value)} placeholder="Camera" className="field min-w-0 sm:col-span-1"/><select value={filters.hasGps} onChange={e => updateFilter('hasGps', e.target.value)} className="select-field min-w-0"><option value="">GPS any</option><option value="true">Has GPS</option><option value="false">No GPS</option></select><select value={filters.hasCamera} onChange={e => updateFilter('hasCamera', e.target.value)} className="select-field min-w-0"><option value="">Camera any</option><option value="true">Has camera</option><option value="false">No camera</option></select></div>{filters.lat && filters.lng && <a className="mt-3 block text-sm text-blue-300 underline" target="_blank" href={`https://www.openstreetmap.org/?mlat=${filters.lat}&mlon=${filters.lng}#map=11/${filters.lat}/${filters.lng}`}>Open radius center in OpenStreetMap</a>}<button onClick={() => runSearch()} disabled={loading} className="primary-btn mt-6 w-full px-4 py-3.5">{icons.search} Search library</button></section></div></div></aside>
-  <section className="flex min-h-0 flex-1 flex-col overflow-hidden pl-5 pr-8 pt-5 pb-4"><header className="mb-5 flex shrink-0 flex-wrap items-start justify-between gap-4"><div className="min-w-0 flex-1 pt-1"><p className="text-[17px] font-semibold text-slate-100 underline decoration-slate-500/40 underline-offset-4">{notice}</p><p className="mt-2 truncate font-mono text-[12px] leading-relaxed text-slate-500" title={appInfo?.database_path}>{appInfo?.database_path ? `DB · ${appInfo.database_path}` : 'DB · not connected'}</p></div><div className="glass-panel shrink-0 rounded-lg p-1"><button type="button" onClick={() => setView('grid')} className={`rounded-md px-4 py-2.5 text-[15px] font-bold ${view === 'grid' ? 'primary-btn' : 'text-slate-200'}`}>{icons.grid} Grid</button><button type="button" onClick={() => setView('list')} className={`rounded-md px-4 py-2.5 text-[15px] font-bold ${view === 'list' ? 'primary-btn' : 'text-slate-200'}`}>{icons.list} List</button></div></header><div className="mb-5 grid shrink-0 grid-cols-2 gap-3 lg:grid-cols-4">{statData.map(([icon,k,v]) => <div key={k} className="stat-card flex items-center gap-4 px-5 py-6"><span className="icon-badge text-3xl">{icon}</span><div className="min-w-0"><p className="text-[14px] text-slate-300">{k}</p><p className="mt-0.5 text-[30px] font-black tabular-nums leading-none">{v}</p></div></div>)}</div>{scan && <div className="mb-4 shrink-0 rounded-xl border border-emerald-400/20 bg-emerald-400/10 p-4 text-sm text-emerald-100">Scanned {scan.scanned_files}, imported/updated {scan.imported_or_updated}, skipped {scan.skipped_files}, missing marked {scan.missing_marked}.</div>}<div className="divider-line -ml-5 -mr-8 mb-3 shrink-0" /><div className="flex min-h-0 flex-1 flex-col overflow-y-auto">{items.length === 0 ? <div className="flex flex-1 flex-col items-center justify-center gap-4 py-10 text-center"><div className="empty-orb text-7xl">{icons.box}</div><h2 className="text-xl font-black text-slate-100 sm:text-2xl">Your media library is ready</h2><p className="max-w-md px-4 text-sm text-slate-500">Add folders in setup, run a scan, then search or browse your grid.</p></div> : <div className={view === 'grid' ? 'grid grid-cols-2 gap-3 pb-4 sm:gap-4 lg:grid-cols-3 xl:grid-cols-4' : 'space-y-3 pb-4'}>{items.map(item => <button key={item.id} onClick={() => openItem(item)} className={`glass-panel overflow-hidden rounded-xl text-left hover:border-blue-400/70 ${view === 'list' ? 'flex w-full items-center gap-4 p-3' : ''}`}>{item.media_type === 'image' ? <img src={mediaUrl(item)} className={view === 'grid' ? 'h-44 w-full object-cover' : 'h-20 w-28 shrink-0 rounded-xl object-cover'} /> : <div className={view === 'grid' ? 'flex h-44 items-center justify-center bg-slate-800' : 'flex h-20 w-28 shrink-0 items-center justify-center rounded-xl bg-slate-800'}>▶</div>}<div className="min-w-0 p-3"><p className="truncate font-semibold">{item.file_name}</p><p className="text-xs text-slate-400">{item.media_type} · {formatBytes(item.size_bytes)} · {formatDate(item.captured_at || item.modified_at)}</p><p className="truncate text-xs text-slate-500">{item.camera_model || item.lens_model || (item.latitude != null ? 'GPS tagged' : 'No metadata')}</p></div></button>)}</div>}</div></section></div>
-  {setupOpen && <div className="fixed inset-0 z-40 flex items-center justify-center bg-black/70 p-6"><div className="glass-panel w-full max-w-4xl rounded-3xl p-6"><div className="flex items-start justify-between"><div><p className="text-xs uppercase tracking-[0.35em] text-blue-300">Setup wizard</p><h2 className="mt-2 text-2xl font-black">Folders, provider, privacy</h2></div><button onClick={() => setSetupOpen(false)} className="text-slate-400 hover:text-white">✕</button></div><div className="mt-6 grid gap-5 md:grid-cols-3"><section className="glass-panel rounded-2xl p-4 md:col-span-2"><h3 className="font-semibold">Media folders</h3><div className="mt-3 flex gap-2"><input value={folderInput} onChange={e => setFolderInput(e.target.value)} placeholder="/Users/you/Pictures" className="field flex-1"/><button onClick={() => addFolder()} className="primary-btn px-4">Add</button><button onClick={chooseFolder} className="primary-btn px-4">Pick…</button></div><div className="mt-3 space-y-2">{folders.map(f => <div key={f} className="flex items-center justify-between rounded-lg bg-slate-950/60 px-3 py-2 text-sm"><span className="truncate">{f}</span><button onClick={() => removeFolder(f)} className="text-red-300">Remove</button></div>)}</div></section><section className="glass-panel rounded-2xl p-4"><h3 className="font-semibold">Provider / people</h3><select value={provider} onChange={e => setProvider(e.target.value)} className="select-field mt-3">{providers.map(p => <option key={p}>{p}</option>)}</select><label className="mt-4 flex items-center gap-2 text-sm"><input type="checkbox" checked={allowRemote} onChange={e => setAllowRemote(e.target.checked)} /> Consent to remote provider</label><button onClick={() => sidecar('generate_embeddings')} className="primary-btn mt-4 w-full px-3 py-2">Generate embeddings</button><button onClick={() => sidecar('cluster_faces')} className="primary-btn mt-3 w-full px-3 py-2">Cluster faces</button></section></div><section className="glass-panel mt-5 rounded-2xl p-4"><h3 className="font-semibold">People</h3><div className="mt-3 grid gap-2 md:grid-cols-2">{people.map(p => <div key={p.id} className="flex gap-2"><input className="field" value={rename[p.id] ?? p.name} onChange={e => setRename(r => ({...r, [p.id]: e.target.value}))}/><button className="primary-btn px-3" onClick={() => renamePerson(p.id)}>Save</button></div>)}</div></section><div className="mt-6 flex justify-end gap-3"><button onClick={() => setSetupOpen(false)} className="rounded-xl border border-white/10 px-4 py-2">Later</button><button onClick={() => scanFolders()} className="primary-btn px-5 py-2">Scan now</button></div></div></div>}
+  const gridColumns = view === 'grid' ? (scrollMetrics.width >= 1280 ? 4 : scrollMetrics.width >= 1024 ? 3 : scrollMetrics.width >= 640 ? 2 : 2) : 1;
+  const rowHeight = view === 'grid' ? 264 : 112;
+  const overscanRows = 3;
+  const startRow = Math.max(0, Math.floor(scrollMetrics.top / rowHeight) - overscanRows);
+  const endRow = Math.ceil((scrollMetrics.top + scrollMetrics.height) / rowHeight) + overscanRows;
+  const startIndex = startRow * gridColumns;
+  const endIndex = Math.min(items.length, endRow * gridColumns);
+  const visibleItems = items.slice(startIndex, endIndex);
+  const beforeRows = Math.floor(startIndex / gridColumns);
+  const afterRows = Math.max(0, Math.ceil((items.length - endIndex) / gridColumns));
+
+  return <main className="app-shell flex h-dvh min-h-0 flex-col"><div className="flex min-h-0 flex-1"><aside className="w-[min(420px,40vw)] min-w-[300px] shrink-0 px-3 pb-6 pt-4"><div className="glass-panel flex h-full min-h-0 flex-col overflow-hidden rounded-[13px]"><div className="overflow-y-auto px-6 pb-6 pt-8"><div className="flex items-baseline justify-between gap-3"><p className="text-[13px] font-black uppercase tracking-[0.42em] text-[#4da8ff]">Private library</p><span className="shrink-0 text-[11px] font-semibold uppercase tracking-[0.2em] text-slate-500">Local index</span></div><h1 className="mt-4 text-[32px] font-black leading-tight tracking-[-0.04em]">Rich Media Viewer</h1><p className="mt-3 text-[15px] leading-snug text-slate-400">Local-first media indexing with metadata, faces and embeddings.</p><button onClick={() => setSetupOpen(true)} className="mt-6 flex w-full items-center justify-between rounded-lg border border-slate-500/25 bg-slate-950/20 px-4 py-3.5 text-left text-[15px] font-extrabold hover:border-blue-400/60"><span className="flex items-center gap-2"><span className="text-lg">{icons.folder}</span> Setup folders / providers</span><span>›</span></button>
+  <section className="glass-panel mt-5 rounded-xl p-4"><label><span className="label">Semantic / filename query</span><input value={filters.query} onChange={e => updateFilter('query', e.target.value)} placeholder="sunset beach, dog, receipt..." className="field" /></label><p className="mt-2 text-xs text-slate-400">Uses semantic vector search when embeddings exist, then falls back to filename/path matching.</p><div className="mt-5 grid grid-cols-2 gap-4"><label><span className="sub-label">From</span><input type="date" value={filters.from} onChange={e => updateFilter('from', e.target.value)} className="field" /></label><label><span className="sub-label">To</span><input type="date" value={filters.to} onChange={e => updateFilter('to', e.target.value)} className="field" /></label></div><div className="mt-5 space-y-3"><div className="grid grid-cols-2 gap-3"><input value={filters.lat} onChange={e => updateFilter('lat', e.target.value)} placeholder="Latitude" className="field min-w-0"/><input value={filters.lng} onChange={e => updateFilter('lng', e.target.value)} placeholder="Longitude" className="field min-w-0"/></div><input value={filters.radius} onChange={e => updateFilter('radius', e.target.value)} placeholder="Radius (km)" className="field w-full max-w-full"/></div><div className="mt-5 grid grid-cols-2 gap-4"><select value={filters.personId} onChange={e => updateFilter('personId', e.target.value)} className="select-field min-w-0"><option value="">All people</option>{people.map(p => <option key={p.id} value={p.id}>{p.name} ({p.face_count})</option>)}</select><input value={filters.personName} onChange={e => updateFilter('personName', e.target.value)} placeholder="Person name contains" className="field min-w-0" /></div><div className="mt-5 grid grid-cols-2 gap-4"><select value={filters.mediaType} onChange={e => updateFilter('mediaType', e.target.value)} className="select-field min-w-0"><option value="">All media</option><option value="image">Images</option><option value="video">Videos</option></select><select value={filters.missing} onChange={e => updateFilter('missing', e.target.value)} className="select-field min-w-0"><option value="">Any status</option><option value="false">Available</option><option value="true">Missing</option></select></div><div className="mt-5 grid grid-cols-1 gap-3 sm:grid-cols-3"><input value={filters.camera} onChange={e => updateFilter('camera', e.target.value)} placeholder="Camera" className="field min-w-0 sm:col-span-1"/><select value={filters.hasGps} onChange={e => updateFilter('hasGps', e.target.value)} className="select-field min-w-0"><option value="">GPS any</option><option value="true">Has GPS</option><option value="false">No GPS</option></select><select value={filters.hasCamera} onChange={e => updateFilter('hasCamera', e.target.value)} className="select-field min-w-0"><option value="">Camera any</option><option value="true">Has camera</option><option value="false">No camera</option></select></div>{filters.lat && filters.lng && <a className="mt-3 block text-sm text-blue-300 underline" target="_blank" href={`https://www.openstreetmap.org/?mlat=${filters.lat}&mlon=${filters.lng}#map=11/${filters.lat}/${filters.lng}`}>Open radius center in OpenStreetMap</a>}<button onClick={() => runSearch()} disabled={loading} className="primary-btn mt-6 w-full px-4 py-3.5 flex items-center justify-center gap-2"><span className="text-lg">{icons.search}</span> Search library</button></section></div></div></aside>
+  <section className="flex min-h-0 flex-1 flex-col overflow-hidden pl-5 pr-8 pt-5 pb-4"><header className="mb-5 flex shrink-0 flex-wrap items-start justify-between gap-4"><div className="min-w-0 flex-1 pt-1"><p className="text-[17px] font-semibold text-slate-100 underline decoration-slate-500/40 underline-offset-4">{notice}</p><p className="mt-2 truncate font-mono text-[12px] leading-relaxed text-slate-500" title={appInfo?.database_path}>{appInfo?.database_path ? `DB · ${appInfo.database_path}` : 'DB · not connected'}</p></div><div className="glass-panel shrink-0 rounded-lg p-1 flex items-center"><button type="button" onClick={() => setView('grid')} className={`flex items-center gap-2 rounded-md px-4 py-2.5 text-[15px] font-bold ${view === 'grid' ? 'primary-btn' : 'text-slate-200'}`}><span className="text-lg">{icons.grid}</span> Grid</button><button type="button" onClick={() => setView('list')} className={`flex items-center gap-2 rounded-md px-4 py-2.5 text-[15px] font-bold ${view === 'list' ? 'primary-btn' : 'text-slate-200'}`}><span className="text-lg">{icons.list}</span> List</button></div></header><div className="mb-5 grid shrink-0 grid-cols-2 gap-3 lg:grid-cols-4">{statData.map(([icon,k,v]) => <div key={k} className="stat-card flex items-center gap-4 px-5 py-6"><span className="icon-badge text-3xl">{icon}</span><div className="min-w-0"><p className="text-[14px] text-slate-300">{k}</p><p className="mt-0.5 text-[30px] font-black tabular-nums leading-none">{v}</p></div></div>)}</div>{scanProgress && loading && <div className="mb-4 shrink-0 rounded-xl border border-blue-400/20 bg-blue-400/10 p-4 text-sm text-blue-100"><div className="mb-2 flex justify-between gap-3"><span>{scanProgress.phase}</span><span>{scanProgress.total_files ? `${scanPercent(scanProgress).toFixed(1)}%` : `${scanProgress.discovered_files ?? 0} discovered`}</span></div><div className="mb-2 grid grid-cols-2 gap-x-4 gap-y-1 text-xs text-blue-100/80 sm:grid-cols-5"><span>{scanProgress.discovered_files ?? 0} discovered</span><span>{scanProgress.total_files ?? '…'} total</span><span>{scanProgress.scanned_files} indexed</span><span>{scanProgress.imported_or_updated} imported</span><span>{scanProgress.skipped_files} skipped · {scanProgress.errors} errors</span></div><div className="h-2 overflow-hidden rounded-full bg-slate-900"><div className={`h-full rounded-full bg-blue-400 ${scanProgress.total_files ? '' : 'w-1/3 animate-pulse'}`} style={scanProgress.total_files ? { width: `${scanPercent(scanProgress)}%` } : undefined} /></div>{scanProgress.current_path && <p className="mt-2 truncate font-mono text-xs text-blue-200/70">{scanProgress.current_path}</p>}</div>}{scan && <div className="mb-4 shrink-0 rounded-xl border border-emerald-400/20 bg-emerald-400/10 p-4 text-sm text-emerald-100">Scanned {scan.scanned_files}, imported/updated {scan.imported_or_updated}, skipped {scan.skipped_files}, missing marked {scan.missing_marked}.</div>}<div className="divider-line -ml-5 -mr-8 mb-3 shrink-0" /><div ref={scrollerRef} onScroll={maybeLoadMore} className="flex min-h-0 flex-1 flex-col overflow-y-auto">{items.length === 0 ? <div className="flex flex-1 flex-col items-center justify-center gap-4 py-10 text-center"><div className="empty-orb text-7xl">{icons.box}</div><h2 className="text-xl font-black text-slate-100 sm:text-2xl">Your media library is ready</h2><p className="max-w-md px-4 text-sm text-slate-500">Add folders in setup, run a scan, then search or browse your grid.</p></div> : <><div style={{ height: beforeRows * rowHeight }} /><div className={view === 'grid' ? 'grid grid-cols-2 gap-3 pb-4 sm:gap-4 lg:grid-cols-3 xl:grid-cols-4' : 'space-y-3 pb-4'}>{visibleItems.map(item => <button key={item.id} onClick={() => openItem(item)} className={`media-card glass-panel overflow-hidden rounded-xl text-left hover:border-blue-400/70 ${view === 'list' ? 'flex w-full items-center gap-4 p-3' : ''}`}><LazyMediaThumb item={item} view={view} /><div className="min-w-0 p-3"><p className="truncate font-semibold">{item.file_name}</p><p className="text-xs text-slate-400">{item.media_type} · {formatBytes(item.size_bytes)} · {formatDate(item.captured_at || item.modified_at)}</p><p className="truncate text-xs text-slate-500">{item.camera_model || item.lens_model || (item.latitude != null ? 'GPS tagged' : 'No metadata')}</p></div></button>)}</div><div style={{ height: afterRows * rowHeight }} /></>}</div></section></div>
+  {setupOpen && (
+    <div className="fixed inset-0 z-40 flex items-center justify-center bg-black/80 backdrop-blur-sm p-4 sm:p-6">
+      <div className="glass-panel w-full max-w-5xl rounded-[24px] shadow-2xl overflow-hidden flex flex-col max-h-full">
+        {/* Header */}
+        <div className="flex items-center justify-between px-8 py-6 border-b border-white/5 bg-white/[0.02]">
+          <div>
+            <p className="text-[11px] font-bold uppercase tracking-[0.35em] text-[#4da8ff]">Setup Wizard</p>
+            <h2 className="mt-1.5 text-[28px] font-black tracking-tight text-white">Folders, Provider & Privacy</h2>
+          </div>
+          <button onClick={() => setSetupOpen(false)} className="flex h-10 w-10 items-center justify-center rounded-full bg-white/5 text-slate-400 transition-colors hover:bg-white/10 hover:text-white">
+            ✕
+          </button>
+        </div>
+        
+        {/* Body */}
+        <div className="flex-1 overflow-y-auto px-8 py-6 custom-scrollbar">
+          <div className="grid gap-6 md:grid-cols-[1fr_320px]">
+            {/* Left Column: Folders & People */}
+            <div className="flex flex-col gap-6">
+              <section className="glass-panel rounded-2xl p-6 border border-white/[0.04]">
+                <div className="flex items-center gap-3 mb-4">
+                  <span className="flex h-8 w-8 items-center justify-center rounded-lg bg-blue-500/20 text-blue-400">{icons.folder}</span>
+                  <h3 className="text-lg font-bold">Media Folders</h3>
+                </div>
+                <p className="text-sm text-slate-400 mb-5 leading-relaxed">Add folders containing your photos and videos. We'll scan them locally without uploading your original files anywhere.</p>
+                <div className="flex flex-col sm:flex-row gap-3">
+                  <input value={folderInput} onChange={e => setFolderInput(e.target.value)} placeholder="/Users/you/Pictures" className="field flex-1 text-[15px] h-11 px-4"/>
+                  <div className="flex gap-2">
+                    <button onClick={() => addFolder()} className="rounded-xl bg-white/10 px-5 font-semibold text-white transition-colors hover:bg-white/20 h-11">Add</button>
+                    <button onClick={chooseFolder} className="primary-btn px-6 h-11">Pick Folder</button>
+                  </div>
+                </div>
+                {folders.length > 0 && (
+                  <div className="mt-5 space-y-2 rounded-xl bg-slate-900/50 p-2 border border-black/20">
+                    {folders.map(f => (
+                      <div key={f} className="group flex items-center justify-between rounded-lg bg-slate-800/40 px-4 py-3 text-[14px] transition-colors hover:bg-slate-800/60">
+                        <span className="truncate pr-4 text-slate-200">{f}</span>
+                        <button onClick={() => removeFolder(f)} className="shrink-0 text-sm font-medium text-red-400 opacity-80 transition-opacity hover:opacity-100">Remove</button>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </section>
+
+              <section className="glass-panel rounded-2xl p-6 border border-white/[0.04]">
+                <div className="flex items-center gap-3 mb-4">
+                  <span className="flex h-8 w-8 items-center justify-center rounded-lg bg-emerald-500/20 text-emerald-400 text-lg">{icons.user}</span>
+                  <h3 className="text-lg font-bold">People Recognition</h3>
+                </div>
+                <p className="text-sm text-slate-400 mb-5 leading-relaxed">Name the faces found in your media. Changes reflect immediately in search.</p>
+                
+                {people.length === 0 ? (
+                  <div className="rounded-xl border border-dashed border-white/10 p-6 text-center text-sm text-slate-500">
+                    No people found yet. Run "Cluster Faces" first.
+                  </div>
+                ) : (
+                  <div className="grid gap-3 sm:grid-cols-2">
+                    {people.map(p => (
+                      <div key={p.id} className="flex gap-2 items-center rounded-xl bg-slate-900/30 p-2">
+                        <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-slate-800 text-xs font-bold text-slate-300">
+                          {p.face_count}
+                        </div>
+                        <input className="field h-9 flex-1 text-sm bg-transparent border-none shadow-none focus:bg-white/5" value={rename[p.id] ?? p.name} onChange={e => setRename(r => ({...r, [p.id]: e.target.value}))} placeholder="Unnamed person" />
+                        <button className="h-9 rounded-lg bg-white/10 px-3 text-xs font-bold text-white transition-colors hover:bg-white/20" onClick={() => renamePerson(p.id)}>Save</button>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </section>
+            </div>
+
+            {/* Right Column: AI & Processing */}
+            <div className="flex flex-col gap-6">
+              <section className="glass-panel rounded-2xl p-6 border border-white/[0.04] bg-slate-900/40">
+                <div className="flex items-center gap-3 mb-4">
+                  <span className="flex h-8 w-8 items-center justify-center rounded-lg bg-purple-500/20 text-purple-400 text-lg">{icons.sparkles}</span>
+                  <h3 className="text-lg font-bold">AI Features</h3>
+                </div>
+                
+                <div className="space-y-5">
+                  <div>
+                    <label className="text-sm font-medium text-slate-300 mb-2 block">AI Provider</label>
+                    <select value={provider} onChange={e => setProvider(e.target.value)} className="select-field w-full h-11">
+                      {providers.map(p => <option key={p} value={p}>{p.charAt(0).toUpperCase() + p.slice(1)}</option>)}
+                    </select>
+                    <p className="mt-2 text-xs text-slate-500">Ollama is text-only here. Google Gemini Embedding 2 can embed supported images, video, audio, and PDFs. OpenRouter supports multimodal embedding models such as Gemini Embedding 2 Preview for text and images.</p>
+                  </div>
+
+                  <div>
+                    <label className="text-sm font-medium text-slate-300 mb-2 block">Embedding Model</label>
+                    <select value={embeddingModel} onChange={e => setEmbeddingModel(e.target.value)} className="select-field w-full h-11">
+                      {(embeddingModelsByProvider[provider] ?? []).map(m => <option key={m} value={m}>{m}</option>)}
+                    </select>
+                    <p className="mt-2 text-xs text-slate-500">{provider === 'google' ? 'Set GOOGLE_API_KEY or GEMINI_API_KEY. Text-only Google models skip media files.' : provider === 'openrouter' ? 'Set OPENROUTER_API_KEY. Models without image support skip media files.' : 'Pull the selected model in Ollama first. Media files are skipped because Ollama embeddings accept text input.'}</p>
+                  </div>
+
+                  <div className="pt-2 space-y-3">
+                    <button onClick={() => sidecar('generate_embeddings')} className="flex w-full items-center justify-center gap-2 rounded-xl bg-slate-800 px-4 py-3.5 text-[14px] font-bold text-slate-200 transition-colors hover:bg-slate-700 hover:text-white border border-white/5">
+                      Generate Embeddings
+                    </button>
+                    <button onClick={openFaceSetup} className="flex w-full items-center justify-center gap-2 rounded-xl bg-slate-800 px-4 py-3.5 text-[14px] font-bold text-slate-200 transition-colors hover:bg-slate-700 hover:text-white border border-white/5">
+                      Guided Face Setup
+                    </button>
+                  </div>
+                </div>
+              </section>
+            </div>
+          </div>
+        </div>
+        
+        {/* Footer */}
+        <div className="border-t border-white/5 bg-slate-950/50 px-8 py-5">
+          {scanProgress && loading && <div className="mb-4 rounded-xl border border-blue-400/20 bg-blue-400/10 p-3 text-sm text-blue-100"><div className="mb-2 flex justify-between gap-3"><span>{scanProgress.phase}</span><span>{scanProgress.scanned_files} scanned · {scanProgress.imported_or_updated} imported</span></div><div className="h-2 overflow-hidden rounded-full bg-slate-900"><div className="h-full w-1/3 animate-pulse rounded-full bg-blue-400" /></div>{scanProgress.current_path && <p className="mt-2 truncate font-mono text-xs text-blue-200/70">{scanProgress.current_path}</p>}</div>}
+          <div className="flex items-center justify-between">
+            <p className="text-sm text-slate-500 hidden sm:block">Selecting a folder only saves it. Files are read when you scan.</p>
+            <div className="flex flex-1 sm:flex-none justify-end gap-3">
+              <button disabled={loading} onClick={deleteIndex} className="rounded-xl border border-red-400/30 bg-red-500/10 px-5 py-3 font-semibold text-red-200 transition-colors hover:bg-red-500/20 disabled:opacity-50">Delete Index</button>
+              <button disabled={loading} onClick={() => setSetupOpen(false)} className="rounded-xl px-6 py-3 font-semibold text-slate-300 transition-colors hover:bg-white/10 hover:text-white disabled:opacity-50">Close</button>
+              <button disabled={loading} onClick={() => scanFolders()} className="primary-btn px-8 py-3 text-[15px] disabled:opacity-50">{loading ? 'Scanning…' : 'Scan Library Now'}</button>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  )}
+  {faceSetupOpen && <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/85 p-4" onClick={() => setFaceSetupOpen(false)}><div onClick={e => e.stopPropagation()} className="glass-panel flex max-h-[94vh] w-full max-w-7xl flex-col overflow-hidden rounded-3xl"><div className="flex items-center justify-between border-b border-white/10 p-5"><div><p className="text-xs font-bold uppercase tracking-[0.3em] text-blue-300">Guided Face Setup</p><h2 className="text-2xl font-black">Sequential face recognition</h2><p className="text-sm text-slate-400">Processes only the image you are viewing. Name a face and matching known faces appear in subsequent images.</p></div><button onClick={() => setFaceSetupOpen(false)} className="text-slate-400 hover:text-white">✕</button></div><div className="grid min-h-0 flex-1 gap-4 overflow-hidden p-4 lg:grid-cols-[1fr_360px]"><section className="flex min-h-0 flex-col gap-3"><div className="flex items-center justify-between gap-3"><button disabled={faceIndex<=0||faceBusy} onClick={() => goFace(-1)} className="rounded-xl bg-white/10 px-4 py-2 font-bold disabled:opacity-40">← Previous</button><p className="truncate text-sm text-slate-300">{faceItems.length ? `${faceIndex + 1} / ${faceItems.length} · ${faceItems[faceIndex]?.file_name}` : 'No images found'}</p><button disabled={faceIndex>=faceItems.length-1||faceBusy} onClick={() => goFace(1)} className="rounded-xl bg-white/10 px-4 py-2 font-bold disabled:opacity-40">Next →</button></div><div className="flex min-h-0 flex-1 items-center justify-center rounded-2xl bg-black/40 p-2">{faceItems[faceIndex] && <img src={mediaUrl(faceItems[faceIndex])} className="max-h-full max-w-full rounded-xl object-contain" />}</div></section><aside className="min-h-0 overflow-y-auto rounded-2xl border border-white/10 bg-slate-950/30 p-4"><div className="mb-4 flex items-center justify-between"><h3 className="font-black">Faces in this image</h3>{faceBusy && <span className="text-xs text-blue-300">Processing…</span>}</div>{!faceBusy && faces.length===0 && <p className="rounded-xl border border-dashed border-white/10 p-5 text-center text-sm text-slate-500">No faces detected here. Move to the next image.</p>}<div className="space-y-3">{faces.map(f => <div key={f.id} className="rounded-xl bg-slate-900/60 p-3"><div className="mb-2 flex items-center justify-between text-xs text-slate-400"><span>Face #{f.id}</span><span>{f.person_name || 'Unknown'}</span></div><div className="flex gap-2"><input className="field h-10 flex-1" value={faceNames[f.id] ?? ''} onChange={e => setFaceNames(n => ({...n, [f.id]: e.target.value}))} placeholder="Name this person" /><button onClick={() => saveFaceName(f.id)} disabled={faceBusy || !(faceNames[f.id] || '').trim()} className="primary-btn px-4 disabled:opacity-40">Save</button></div><p className="mt-2 text-xs text-slate-500">Box: {Math.round(f.x)}, {Math.round(f.y)} · {Math.round(f.width)}×{Math.round(f.height)}</p></div>)}</div></aside></div></div></div>}
   {selected && <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 p-6" onClick={() => setSelected(null)}><div onClick={e => e.stopPropagation()} className="glass-panel max-h-[92vh] w-full max-w-6xl overflow-auto rounded-3xl"><div className="flex items-center justify-between border-b border-white/10 p-4"><div><h2 className="font-bold">{selected.file_name}</h2><p className="text-xs text-slate-400">{selected.path}</p></div><button onClick={() => setSelected(null)} className="text-slate-400 hover:text-white">✕</button></div><div className="grid gap-4 p-4 lg:grid-cols-[1fr_330px]">{selected.media_type === 'video' ? <video src={mediaUrl(selected)} controls className="max-h-[70vh] w-full rounded-2xl bg-black" /> : <img src={mediaUrl(selected)} className="max-h-[70vh] w-full rounded-2xl bg-black object-contain" />}<aside className="glass-panel space-y-3 rounded-2xl p-4 text-sm"><p><b>Type:</b> {selected.media_type}</p><p><b>Size:</b> {formatBytes(selected.size_bytes)}</p>{metaRows(selected).map(([k,v]) => <p key={k}><b>{k}:</b> {v}</p>)}<p><b>Status:</b> {selected.missing ? 'Missing' : 'Available'}</p>{selected.latitude != null && selected.longitude != null && <><iframe title="OpenStreetMap" className="h-48 w-full rounded-xl border-0" src={`https://www.openstreetmap.org/export/embed.html?bbox=${selected.longitude-0.03}%2C${selected.latitude-0.03}%2C${selected.longitude+0.03}%2C${selected.latitude+0.03}&layer=mapnik&marker=${selected.latitude}%2C${selected.longitude}`} /><a className="text-blue-300 underline" target="_blank" href={`https://www.openstreetmap.org/?mlat=${selected.latitude}&mlon=${selected.longitude}#map=14/${selected.latitude}/${selected.longitude}`}>Open location</a></>}</aside></div></div></div>}</main>;
 }
 

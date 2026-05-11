@@ -13,9 +13,9 @@ Local-first desktop app for cataloging, searching, and viewing image/video libra
 - EXIF extraction for image capture date, camera make/model, lens, and GPS where available.
 - Unified filters for filename/path, date range, GPS radius, person, media type, missing status, camera, has-GPS, and has-camera.
 - Grid/list results, image/video viewer, and OpenStreetMap links/embeds for GPS-tagged media.
-- Local Python sidecar integration for OpenCV face detection/clustering and deterministic local embeddings.
+- Python sidecar integration for OpenCV face detection/clustering and provider-backed embeddings.
 - People naming/search through detected clusters.
-- Embedding generation and semantic text search over stored vectors. Remote provider paths require explicit consent.
+- Embedding generation and semantic text search over stored vectors with Ollama, Google, or OpenRouter providers.
 
 ## Run in development
 
@@ -40,7 +40,7 @@ python3 -m compileall python-sidecar/rich_media_sidecar
 
 ## Python sidecar dependencies
 
-The sidecar uses `numpy`, `Pillow`, and `opencv-python-headless` for local embeddings and face detection. Install them for full ML functionality:
+The sidecar uses `numpy`, `Pillow`, and `opencv-python-headless` for local face detection and clustering. Install them for full face-recognition functionality:
 
 ```bash
 python3 -m pip install -r python-sidecar/requirements.txt

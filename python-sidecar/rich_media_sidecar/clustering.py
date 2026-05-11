@@ -3,13 +3,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from hashlib import sha256
 from pathlib import Path
-import math
 
 import numpy as np
 from PIL import Image
-
-from .providers import deterministic_vector
 
 try:
     import cv2  # type: ignore
@@ -40,6 +38,17 @@ def cosine(a: list[float], b: list[float]) -> float:
     return float(np.dot(av, bv) / denom) if denom else 0.0
 
 
+def deterministic_face_vector(seed: str, dimensions: int = 64) -> list[float]:
+    vals: list[float] = []
+    counter = 0
+    while len(vals) < dimensions:
+        digest = sha256(f"{seed}:{counter}".encode()).digest()
+        vals.extend([(b / 127.5) - 1.0 for b in digest])
+        counter += 1
+    norm = sum(v * v for v in vals[:dimensions]) ** 0.5
+    return [round(float(v / norm), 6) if norm else 0.0 for v in vals[:dimensions]]
+
+
 def face_embedding(image_path: Path, bbox: list[int], dimensions: int = 64) -> list[float]:
     try:
         with Image.open(image_path) as img:
@@ -60,7 +69,7 @@ def face_embedding(image_path: Path, bbox: list[int], dimensions: int = 64) -> l
             if norm: feats = feats / norm
             return [round(float(v), 6) for v in feats]
     except Exception:
-        return deterministic_vector(f"face:{image_path}:{bbox}", dimensions)
+        return deterministic_face_vector(f"face:{image_path}:{bbox}", dimensions)
 
 
 class LocalFaceClusterer:

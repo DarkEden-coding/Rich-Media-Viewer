@@ -4,16 +4,17 @@ The Python sidecar lives under `python-sidecar/` and is invoked by the Rust/Taur
 
 ## Responsibilities
 
-- Local-first media intelligence.
+- Media intelligence for local indexing and optional remote embeddings.
 - OpenCV Haar face detection and deterministic face-embedding clustering.
-- Local deterministic image/text/video embeddings.
-- Remote provider interfaces for Google/OpenRouter-style calls, gated by explicit consent.
+- Embedding provider interfaces for Ollama, Google, and OpenRouter.
+- Capability-aware media embedding. OpenRouter uses its documented multimodal embedding format for image-capable models such as `google/gemini-embedding-2-preview`.
 - JSON CLI protocol for Rust subprocess integration.
 
 ## Commands
 
-- `python3 -m rich_media_sidecar embed --provider local --text "query"`
-- `python3 -m rich_media_sidecar embed --provider local /path/to/image.jpg`
+- `python3 -m rich_media_sidecar embed --provider ollama --text "query"`
+- `python3 -m rich_media_sidecar embed --provider google --model gemini-embedding-2 /path/to/image.jpg`
+- `python3 -m rich_media_sidecar embed --provider openrouter --model google/gemini-embedding-2-preview /path/to/image.jpg`
 - `python3 -m rich_media_sidecar cluster-faces /path/to/image.jpg`
 - `python3 -m rich_media_sidecar semantic-search --query "beach" --vectors '[...]'`
 
@@ -25,7 +26,7 @@ Rust commands currently call the sidecar for:
 
 ## Privacy
 
-Face recognition is local only. Remote embedding providers refuse to run unless the app passes explicit `allow_remote` consent.
+Face recognition is local only. Google and OpenRouter embedding providers send selected query text and supported media inputs to remote APIs when the user selects and configures those providers.
 
 ## Packaging
 

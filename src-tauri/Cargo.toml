@@ -3,6 +3,7 @@ name = "rich-media-viewer"
 version = "0.1.0"
 description = "Rich Media Viewer desktop app"
 authors = ["Rich Media Viewer Contributors"]
+default-run = "rich-media-viewer"
 edition = "2021"
 
 [lib]
@@ -21,3 +22,4 @@ rusqlite = { version = "0.31", features = ["bundled"] }
 walkdir = "2"
 kamadak-exif = "0.6"
 chrono = { version = "0.4", default-features = false, features = ["std"] }
+rayon = "1"
