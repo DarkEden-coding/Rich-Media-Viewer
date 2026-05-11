@@ -606,8 +606,13 @@ function App() {
     width: number;
     height: number;
   } | null>(null);
+  const [faceImageRect, setFaceImageRect] = useState<{
+    width: number;
+    height: number;
+  } | null>(null);
   const scrollerRef = useRef<HTMLDivElement | null>(null);
   const faceRequestRef = useRef(0);
+  const faceImageRef = useRef<HTMLImageElement | null>(null);
   const searchRequestRef = useRef(0);
   const searchOffsetRef = useRef(0);
   const activeFilterRef = useRef(emptyFilters);
@@ -632,6 +637,12 @@ function App() {
     [icons.video, "Videos", counts.videos],
     [icons.missing, "Missing", counts.missing],
   ] as const;
+  const currentFaceItem = faceItems[faceIndex];
+  const visibleFaces = currentFaceItem
+    ? faces.filter((f) => f.media_item_id === currentFaceItem.id)
+    : [];
+  const unnamedFacesHere = visibleFaces.filter((f) => f.person_id == null);
+  const namedFacesHere = visibleFaces.filter((f) => f.person_id != null);
 
   async function loadSettings() {
     const s = await invoke<{ library_folders: string[] }>("get_settings");
@@ -813,6 +824,18 @@ function App() {
       unlisten.then((f) => f());
     };
   }, []);
+  useEffect(() => {
+    if (!faceSetupOpen) return;
+    const updateFaceImageRect = () => {
+      const image = faceImageRef.current;
+      if (!image) return;
+      const rect = image.getBoundingClientRect();
+      setFaceImageRect({ width: rect.width, height: rect.height });
+    };
+    updateFaceImageRect();
+    window.addEventListener("resize", updateFaceImageRect);
+    return () => window.removeEventListener("resize", updateFaceImageRect);
+  }, [faceSetupOpen, currentFaceItem?.id]);
   useEffect(() => {
     localStorage.setItem("rmv.provider", provider);
   }, [provider]);
@@ -1049,6 +1072,7 @@ function App() {
     setFaces([]);
     setFaceNames({});
     setFaceImageSize(null);
+    setFaceImageRect(null);
     setNotice("Guided face setup opened. Faces process one image at a time.");
     try {
       const result = await invoke<MediaItem[]>("search_media", {
@@ -1089,6 +1113,7 @@ function App() {
     setFaces([]);
     setFaceNames({});
     setFaceImageSize(null);
+    setFaceImageRect(null);
     setFaceBusy(true);
     try {
       await invoke<SidecarResult>("process_face_setup_image", { mediaId });
@@ -1143,13 +1168,6 @@ function App() {
       if (requestId === faceRequestRef.current) setFaceBusy(false);
     }
   }
-  const currentFaceItem = faceItems[faceIndex];
-  const visibleFaces = currentFaceItem
-    ? faces.filter((f) => f.media_item_id === currentFaceItem.id)
-    : [];
-  const unnamedFacesHere = visibleFaces.filter((f) => f.person_id == null);
-  const namedFacesHere = visibleFaces.filter((f) => f.person_id != null);
-
   return (
     <main className="app-shell flex h-dvh min-h-0 flex-col">
       <div className="flex min-h-0 flex-1">
@@ -2041,38 +2059,35 @@ function App() {
                   {currentFaceItem && (
                     <div className="relative max-h-full max-w-full">
                       <img
+                        ref={faceImageRef}
                         src={mediaUrl(currentFaceItem)}
-                        onLoad={(e) =>
+                        onLoad={(e) => {
+                          const rect = e.currentTarget.getBoundingClientRect();
                           setFaceImageSize({
                             width: e.currentTarget.naturalWidth,
                             height: e.currentTarget.naturalHeight,
-                          })
-                        }
+                          });
+                          setFaceImageRect({
+                            width: rect.width,
+                            height: rect.height,
+                          });
+                        }}
                         className="block max-h-full max-w-full rounded-xl object-contain"
                       />
                       {faceImageSize &&
+                        faceImageRect &&
                         visibleFaces.map((f) => {
-                          const left = Math.max(
-                            0,
-                            Math.min(100, (f.x / faceImageSize.width) * 100),
-                          );
-                          const top = Math.max(
-                            0,
-                            Math.min(100, (f.y / faceImageSize.height) * 100),
-                          );
+                          const scaleX = faceImageRect.width / faceImageSize.width;
+                          const scaleY = faceImageRect.height / faceImageSize.height;
+                          const left = Math.max(0, f.x * scaleX);
+                          const top = Math.max(0, f.y * scaleY);
                           const width = Math.max(
                             0,
-                            Math.min(
-                              100 - left,
-                              (f.width / faceImageSize.width) * 100,
-                            ),
+                            Math.min(faceImageRect.width - left, f.width * scaleX),
                           );
                           const height = Math.max(
                             0,
-                            Math.min(
-                              100 - top,
-                              (f.height / faceImageSize.height) * 100,
-                            ),
+                            Math.min(faceImageRect.height - top, f.height * scaleY),
                           );
                           const named = f.person_id != null;
                           const unnamedIdx = named
@@ -2087,10 +2102,10 @@ function App() {
                                   : "border-blue-300 shadow-[0_0_24px_rgba(96,165,250,0.45)]"
                               }`}
                               style={{
-                                left: `${left}%`,
-                                top: `${top}%`,
-                                width: `${width}%`,
-                                height: `${height}%`,
+                                left,
+                                top,
+                                width,
+                                height,
                               }}
                             >
                               <span

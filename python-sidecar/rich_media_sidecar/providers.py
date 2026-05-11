@@ -8,8 +8,13 @@ import base64
 import json
 import mimetypes
 import os
+import sysconfig
 import threading
 import tempfile
+import ctypes
+import ctypes.util
+import contextlib
+import warnings
 from io import BytesIO
 from dataclasses import dataclass
 from pathlib import Path
@@ -17,6 +22,11 @@ from typing import Iterable, Protocol
 from urllib import request, error
 
 from PIL import Image
+
+os.environ.setdefault("ORT_LOG_SEVERITY_LEVEL", "3")
+warnings.filterwarnings("ignore", message="Cannot enable progress bars.*", category=UserWarning)
+
+_DLL_DIRECTORY_HANDLES: list[object] = []
 
 FASTEMBED_EMBEDDING_MODELS = [
     "Qdrant/clip-ViT-B-32",
@@ -76,6 +86,56 @@ def _guess_mime(path: Path) -> str | None:
 
 def _unsupported(path: Path, provider: str, model: str, message: str) -> EmbeddingResult:
     return EmbeddingResult(str(path), provider, [], kind="unsupported", model=model, error=message)
+
+
+def _add_nvidia_dll_directories() -> None:
+    if os.name != "nt":
+        return
+    site_paths = {
+        Path(p)
+        for p in sysconfig.get_paths().values()
+        if p
+    }
+    for site_path in list(site_paths):
+        site_paths.add(site_path.parent)
+    candidate_dirs: list[Path] = []
+    for site_path in site_paths:
+        nvidia_root = site_path / "nvidia"
+        if not nvidia_root.exists():
+            continue
+        for child in nvidia_root.iterdir():
+            for name in ("bin", "lib"):
+                path = child / name
+                if path.is_dir():
+                    candidate_dirs.append(path)
+    for path in candidate_dirs:
+        path_str = str(path)
+        if path_str not in os.environ.get("PATH", ""):
+            os.environ["PATH"] = path_str + os.pathsep + os.environ.get("PATH", "")
+        if hasattr(os, "add_dll_directory"):
+            try:
+                _DLL_DIRECTORY_HANDLES.append(os.add_dll_directory(path_str))
+            except OSError:
+                pass
+
+
+@contextlib.contextmanager
+def _suppress_native_stderr():
+    if os.getenv("RMV_SUPPRESS_NATIVE_STDERR", "1").lower() in {"0", "false", "no"}:
+        yield
+        return
+    try:
+        stderr_fd = 2
+        saved_fd = os.dup(stderr_fd)
+        with open(os.devnull, "wb") as devnull:
+            os.dup2(devnull.fileno(), stderr_fd)
+            try:
+                yield
+            finally:
+                os.dup2(saved_fd, stderr_fd)
+                os.close(saved_fd)
+    except Exception:
+        yield
 
 
 def _image_bytes_for_embedding(path: Path, mime: str, max_width: int | None) -> tuple[str, str]:
@@ -162,8 +222,13 @@ class FastEmbedEmbeddingProvider:
         if self.device == "cpu":
             return ["CPUExecutionProvider"]
         cuda_providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
+        cuda_ready, reason = self._cuda_runtime_ready()
         if self.device == "cuda":
+            if not cuda_ready:
+                raise RemoteProviderUnavailableError(f"FastEmbed CUDA requested but unavailable: {reason}")
             return cuda_providers
+        if not cuda_ready:
+            return ["CPUExecutionProvider"]
         try:
             import onnxruntime as ort
             if "CUDAExecutionProvider" in ort.get_available_providers():
@@ -172,17 +237,45 @@ class FastEmbedEmbeddingProvider:
             pass
         return ["CPUExecutionProvider"]
 
+    @staticmethod
+    def _cuda_runtime_ready() -> tuple[bool, str]:
+        _add_nvidia_dll_directories()
+        try:
+            import onnxruntime as ort
+            if "CUDAExecutionProvider" not in ort.get_available_providers():
+                return False, "ONNX Runtime CUDAExecutionProvider is not installed."
+        except Exception as exc:
+            return False, f"failed to inspect ONNX Runtime providers: {exc}"
+        if os.name == "nt":
+            missing = []
+            for dll in ("cudnn64_9.dll",):
+                found = ctypes.util.find_library(dll) or any(
+                    Path(part).joinpath(dll).exists()
+                    for part in os.environ.get("PATH", "").split(os.pathsep)
+                    if part
+                )
+                if not found:
+                    missing.append(dll)
+            if missing:
+                return False, f"missing {', '.join(missing)} on PATH."
+        try:
+            ctypes.CDLL("cudnn64_9.dll" if os.name == "nt" else "libcudnn.so.9")
+        except OSError as exc:
+            return False, f"cuDNN runtime could not be loaded: {exc}"
+        return True, "CUDA runtime is available."
+
     def _get_image_model(self):
         if self._image_model is None:
             try:
                 from fastembed import ImageEmbedding
             except ImportError as exc:
                 raise RemoteProviderUnavailableError("FastEmbed is not installed. Install python-sidecar dependencies before using local FastEmbed embeddings.") from exc
-            self._image_model = ImageEmbedding(
-                self.image_model_name,
-                threads=self.threads,
-                providers=self.providers,
-            )
+            with _suppress_native_stderr():
+                self._image_model = ImageEmbedding(
+                    self.image_model_name,
+                    threads=self.threads,
+                    providers=self.providers,
+                )
         return self._image_model
 
     def _get_text_model(self):
@@ -191,11 +284,12 @@ class FastEmbedEmbeddingProvider:
                 from fastembed import TextEmbedding
             except ImportError as exc:
                 raise RemoteProviderUnavailableError("FastEmbed is not installed. Install python-sidecar dependencies before using local FastEmbed embeddings.") from exc
-            self._text_model = TextEmbedding(
-                self.text_model_name,
-                threads=self.threads,
-                providers=self.providers,
-            )
+            with _suppress_native_stderr():
+                self._text_model = TextEmbedding(
+                    self.text_model_name,
+                    threads=self.threads,
+                    providers=self.providers,
+                )
         return self._text_model
 
     def embed_path(self, path: Path) -> EmbeddingResult:
@@ -264,12 +358,13 @@ class FastEmbedEmbeddingProvider:
     def _embed_supported_batch(self, supported: list[tuple[Path, Path]], max_workers: int) -> list[EmbeddingResult]:
         try:
             embed_inputs = [str(embed_path) for _, embed_path in supported]
+            parallel = self.parallel if "CUDAExecutionProvider" in self.providers else (max_workers if max_workers > 1 else self.parallel)
             with self._lock:
                 vectors = list(
                     self._get_image_model().embed(
                         embed_inputs,
                         batch_size=self.batch_size,
-                        parallel=max_workers if max_workers > 1 else self.parallel,
+                        parallel=parallel,
                     )
                 )
             return [

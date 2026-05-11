@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
+from PIL import Image, ImageOps
 
 from .clustering import ClusterResponse, FaceResult, cosine
 
@@ -197,6 +198,19 @@ def _detect_faces(app: Any, img: Any) -> list[Any]:
         return cpu_app.get(img)
 
 
+def _read_oriented_bgr(path: Path) -> Any | None:
+    """Load an image in the same EXIF-oriented coordinate space browsers display."""
+    if cv2 is None:
+        return None
+    try:
+        with Image.open(path) as source:
+            image = ImageOps.exif_transpose(source).convert("RGB")
+            rgb = np.asarray(image)
+        return cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+    except Exception:
+        return cv2.imread(str(path))
+
+
 def cluster_union_find(embeddings: list[list[float]], threshold: float) -> list[int]:
     """Assign cluster ids using union-find on pairs with cosine >= threshold (via FAISS IP)."""
     n = len(embeddings)
@@ -261,7 +275,7 @@ def cluster_paths(paths: list[Path], threshold: float) -> ClusterResponse:
     detector = "insightface-buffalo_l-scrfd"
     images_read = 0
     for path in paths:
-        img = cv2.imread(str(path))
+        img = _read_oriented_bgr(path)
         if img is None:
             continue
         images_read += 1

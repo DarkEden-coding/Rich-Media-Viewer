@@ -27,6 +27,7 @@ Rust commands currently call the sidecar for:
 ## Privacy
 
 Face recognition is local only. Google and OpenRouter embedding providers send selected query text and supported media inputs to remote APIs when the user selects and configures those providers.
+FastEmbed embeddings remain local and use CUDA when ONNX Runtime can load the CUDA execution provider; otherwise they fall back to CPU.
 
 ## Packaging
 

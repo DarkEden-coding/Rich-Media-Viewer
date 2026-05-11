@@ -19,6 +19,11 @@ JSON CLI for media intelligence. In development it is invoked by the Tauri/Rust 
   - OpenRouter `google/gemini-embedding-2-preview` sends supported image bytes through OpenRouter's multimodal embedding input format
   - Text-only models and unsupported media files are skipped instead of inventing proxy vectors
 
+FastEmbed uses CUDA automatically when ONNX Runtime can load `CUDAExecutionProvider`.
+Set `RMV_FASTEMBED_DEVICE=cpu` to force CPU or `RMV_FASTEMBED_DEVICE=cuda` to require CUDA.
+Tune local throughput with `RMV_EMBEDDING_THREADS` and `RMV_FASTEMBED_BATCH_SIZE`.
+When CUDA is active, the provider keeps FastEmbed image model parallelism at one worker because additional workers contend for the same GPU.
+
 ## Install
 
 ```bash

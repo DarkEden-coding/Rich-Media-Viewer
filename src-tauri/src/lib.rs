@@ -3,6 +3,7 @@ use rusqlite::{params, params_from_iter, Connection, OptionalExtension, ToSql};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, HashSet, VecDeque},
+    cmp::Ordering as CmpOrdering,
     fs,
     io::{BufRead, BufReader, Write},
     path::{Path, PathBuf},
@@ -56,7 +57,7 @@ fn embedding_thread_count(provider: &str) -> usize {
         std::env::var("RMV_EMBEDDING_THREADS")
             .ok()
             .and_then(|v| v.parse().ok())
-            .unwrap_or(16usize)
+            .unwrap_or(4usize)
             .clamp(1, 16)
     } else {
         indexing_thread_count()
@@ -312,6 +313,10 @@ CREATE TABLE IF NOT EXISTS library_folders(id INTEGER PRIMARY KEY AUTOINCREMENT,
     );
     let _ = conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_media_items_sort_date ON media_items(COALESCE(captured_at,modified_at,created_at), id)",
+        [],
+    );
+    let _ = conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_embeddings_model_media ON embeddings(model, media_item_id)",
         [],
     );
     Ok(())
@@ -1957,8 +1962,7 @@ fn process_face_paths(
                 tx.execute("INSERT INTO faces(media_item_id,person_id,x,y,width,height,confidence,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",params![mid,pid,x,y,w,h,conf,now_unix()]).map_err(|e|e.to_string())?;
                 let face_id = tx.last_insert_rowid();
                 if !emb.is_empty() {
-                    let vec_json = serde_json::to_vec(&emb).map_err(|e| e.to_string())?;
-                    tx.execute("INSERT INTO embeddings(face_id,model,vector,created_at) VALUES(?1,?2,?3,?4)",params![face_id,FACE_EMBEDDING_MODEL,vec_json,now_unix()]).map_err(|e|e.to_string())?;
+                    tx.execute("INSERT INTO embeddings(face_id,model,vector,created_at) VALUES(?1,?2,?3,?4)",params![face_id,FACE_EMBEDDING_MODEL,vec_to_blob(&emb),now_unix()]).map_err(|e|e.to_string())?;
                 }
             }
             tx.commit().map_err(|e| e.to_string())?;
@@ -2088,8 +2092,10 @@ fn generate_embeddings_impl(
                     skipped += 1;
                     continue;
                 };
-                let vec_json = serde_json::to_vec(vecv).map_err(|e| e.to_string())?;
-                tx.execute("INSERT INTO embeddings(media_item_id,model,vector,created_at) VALUES(?1,?2,?3,?4)",params![mid,model,vec_json,now_unix()]).map_err(|e|e.to_string())?;
+                let vector: Vec<f32> =
+                    serde_json::from_value(serde_json::Value::Array(vecv.clone()))
+                        .map_err(|e| e.to_string())?;
+                tx.execute("INSERT INTO embeddings(media_item_id,model,vector,created_at) VALUES(?1,?2,?3,?4)",params![mid,model,vec_to_blob(&vector),now_unix()]).map_err(|e|e.to_string())?;
                 inserted += 1;
             }
             tx.commit().map_err(|e| e.to_string())?;
@@ -2128,24 +2134,66 @@ fn generate_embeddings_impl(
     }
     Ok(last_res)
 }
+fn vec_to_blob(v: &[f32]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(v.len() * std::mem::size_of::<f32>());
+    for x in v {
+        out.extend_from_slice(&x.to_le_bytes());
+    }
+    out
+}
 fn parse_vec(b: Vec<u8>) -> Option<Vec<f32>> {
+    if b.len() % std::mem::size_of::<f32>() == 0 && !b.starts_with(b"[") {
+        return Some(
+            b.chunks_exact(std::mem::size_of::<f32>())
+                .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+                .collect(),
+        );
+    }
     serde_json::from_slice(&b).ok().or_else(|| {
         std::str::from_utf8(&b)
             .ok()
             .and_then(|s| serde_json::from_str(s).ok())
     })
 }
-fn cosine(a: &[f32], b: &[f32]) -> f64 {
-    let (mut dot, mut na, mut nb) = (0.0, 0.0, 0.0);
+fn vector_norm(a: &[f32]) -> f32 {
+    a.iter().map(|x| x * x).sum::<f32>().sqrt()
+}
+fn cosine_with_norm(a: &[f32], a_norm: f32, b: &[f32]) -> f64 {
+    let (mut dot, mut nb) = (0.0f32, 0.0f32);
     for (x, y) in a.iter().zip(b) {
-        dot += (*x as f64) * (*y as f64);
-        na += (*x as f64) * (*x as f64);
-        nb += (*y as f64) * (*y as f64);
+        dot += *x * *y;
+        nb += *y * *y;
     }
-    if na == 0.0 || nb == 0.0 {
+    if a_norm == 0.0 || nb == 0.0 {
         0.0
     } else {
-        dot / (na.sqrt() * nb.sqrt())
+        (dot / (a_norm * nb.sqrt())) as f64
+    }
+}
+fn cosine(a: &[f32], b: &[f32]) -> f64 {
+    cosine_with_norm(a, vector_norm(a), b)
+}
+
+#[derive(Debug)]
+struct SemanticCandidate {
+    score: f64,
+    media_id: i64,
+}
+
+impl PartialEq for SemanticCandidate {
+    fn eq(&self, other: &Self) -> bool {
+        self.score == other.score && self.media_id == other.media_id
+    }
+}
+impl Eq for SemanticCandidate {}
+impl PartialOrd for SemanticCandidate {
+    fn partial_cmp(&self, other: &Self) -> Option<CmpOrdering> {
+        self.score.partial_cmp(&other.score)
+    }
+}
+impl Ord for SemanticCandidate {
+    fn cmp(&self, other: &Self) -> CmpOrdering {
+        self.partial_cmp(other).unwrap_or(CmpOrdering::Equal)
     }
 }
 fn search_semantic_impl(
@@ -2155,38 +2203,84 @@ fn search_semantic_impl(
     limit: Option<i64>,
 ) -> Result<Vec<SemanticHit>, String> {
     let c = open_db(&app)?;
-    let mut semantic_sql=format!("SELECT e.vector,media_items.id,media_items.path,media_items.file_name,media_items.extension,media_items.media_type,media_items.size_bytes,media_items.created_at,media_items.modified_at,media_items.imported_at,media_items.missing,media_items.camera_make,media_items.camera_model,media_items.lens_model,media_items.captured_at,media_items.latitude,media_items.longitude,media_items.metadata_json FROM embeddings e JOIN media_items ON media_items.id=e.media_item_id WHERE e.media_item_id IS NOT NULL{}",sql_path_not_blacklisted_clause());
+    let mut semantic_sql = format!(
+        "SELECT e.media_item_id,e.vector FROM embeddings e JOIN media_items ON media_items.id=e.media_item_id WHERE e.media_item_id IS NOT NULL{}",
+        sql_path_not_blacklisted_clause()
+    );
     let mut params_vec: Vec<Box<dyn ToSql>> = vec![];
     if let Some(model) = model {
         semantic_sql.push_str(" AND e.model=?");
         params_vec.push(Box::new(model));
     }
+    let max_hits = limit.unwrap_or(50).clamp(1, 200) as usize;
+    let query_norm = vector_norm(&vector);
     let refs: Vec<&dyn ToSql> = params_vec.iter().map(|x| x.as_ref()).collect();
     let mut s = c.prepare(&semantic_sql).map_err(|e| e.to_string())?;
     let rows = s
         .query_map(params_from_iter(refs), |row| {
-            Ok((row.get::<_, Vec<u8>>(0)?, row_to_media_offset(row, 1)?))
+            Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?))
         })
         .map_err(|e| e.to_string())?;
-    let mut hits = vec![];
+    let mut candidates: Vec<SemanticCandidate> = Vec::with_capacity(max_hits + 1);
     for r in rows {
-        let (b, item) = r.map_err(|e| e.to_string())?;
+        let (media_id, b) = r.map_err(|e| e.to_string())?;
         if let Some(v) = parse_vec(b) {
             if v.len() == vector.len() {
-                hits.push(SemanticHit {
-                    score: cosine(&vector, &v),
-                    item,
-                });
+                let score = cosine_with_norm(&vector, query_norm, &v);
+                if candidates.len() < max_hits {
+                    candidates.push(SemanticCandidate { score, media_id });
+                    if candidates.len() == max_hits {
+                        candidates.sort_by(|a, b| {
+                            a.score
+                                .partial_cmp(&b.score)
+                                .unwrap_or(std::cmp::Ordering::Equal)
+                        });
+                    }
+                } else if score > candidates[0].score {
+                    candidates[0] = SemanticCandidate { score, media_id };
+                    candidates.sort_by(|a, b| {
+                        a.score
+                            .partial_cmp(&b.score)
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                    });
+                }
             }
         }
     }
-    hits.sort_by(|a, b| {
+    candidates.sort_by(|a, b| {
         b.score
             .partial_cmp(&a.score)
             .unwrap_or(std::cmp::Ordering::Equal)
     });
-    hits.truncate(limit.unwrap_or(50).clamp(1, 200) as usize);
-    Ok(hits)
+    let ids: Vec<i64> = candidates.iter().map(|c| c.media_id).collect();
+    if ids.is_empty() {
+        return Ok(vec![]);
+    }
+    let placeholders = std::iter::repeat("?")
+        .take(ids.len())
+        .collect::<Vec<_>>()
+        .join(",");
+    let sql = format!("{MEDIA_SELECT} WHERE id IN ({placeholders})");
+    let mut stmt = c.prepare(&sql).map_err(|e| e.to_string())?;
+    let media_rows = stmt
+        .query_map(params_from_iter(ids.iter()), row_to_media)
+        .map_err(|e| e.to_string())?;
+    let mut media_by_id = HashMap::with_capacity(ids.len());
+    for row in media_rows {
+        let item = row.map_err(|e| e.to_string())?;
+        media_by_id.insert(item.id, item);
+    }
+    Ok(candidates
+        .into_iter()
+        .filter_map(|candidate| {
+            media_by_id
+                .remove(&candidate.media_id)
+                .map(|item| SemanticHit {
+                    score: candidate.score,
+                    item,
+                })
+        })
+        .collect())
 }
 #[tauri::command]
 fn search_semantic(

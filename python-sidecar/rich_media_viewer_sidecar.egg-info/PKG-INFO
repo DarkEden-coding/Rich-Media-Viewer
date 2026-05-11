@@ -13,7 +13,8 @@ Requires-Dist: insightface>=0.7.3
 Requires-Dist: onnxruntime-gpu[cuda,cudnn]>=1.21.0; platform_system == "Windows" or platform_system == "Linux"
 Requires-Dist: onnxruntime>=1.21.0; platform_system != "Windows" and platform_system != "Linux"
 Requires-Dist: faiss-cpu>=1.7.4
-Requires-Dist: fastembed>=0.7.0
+Requires-Dist: fastembed-gpu>=0.7.0; platform_system == "Windows" or platform_system == "Linux"
+Requires-Dist: fastembed>=0.7.0; platform_system != "Windows" and platform_system != "Linux"
 
 # Rich Media Viewer Python Sidecar
 
