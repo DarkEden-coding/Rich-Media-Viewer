@@ -368,6 +368,29 @@ function fileUrl(path: string) {
 function mediaUrl(item: MediaItem) {
   return fileUrl(item.display_path || item.path);
 }
+function videoMimeType(item: MediaItem) {
+  switch (item.extension?.toLowerCase()) {
+    case "mp4":
+    case "m4v":
+      return "video/mp4";
+    case "webm":
+      return "video/webm";
+    case "ogv":
+    case "ogg":
+      return "video/ogg";
+    case "mov":
+      return "video/quicktime";
+    case "mkv":
+      return "video/x-matroska";
+    case "avi":
+      return "video/x-msvideo";
+    default:
+      return undefined;
+  }
+}
+function videoPreviewUrl(item: MediaItem) {
+  return `${mediaUrl(item)}#t=0.001`;
+}
 function dateToEpoch(value: string, end = false) {
   if (!value) return undefined;
   const d = new Date(`${value}T${end ? "23:59:59" : "00:00:00"}`);
@@ -533,6 +556,35 @@ const LazyMediaThumb = memo(function LazyMediaThumb({
 }) {
   const sizeClass =
     view === "grid" ? "h-44 w-full" : "h-20 w-28 shrink-0 rounded-xl";
+  if (item.media_type === "video") {
+    return (
+      <div
+        className={`thumb-placeholder relative overflow-hidden bg-slate-800 ${sizeClass}`}
+      >
+        <video
+          src={videoPreviewUrl(item)}
+          preload="metadata"
+          muted
+          playsInline
+          onLoadedMetadata={(e) => {
+            if (e.currentTarget.currentTime === 0) {
+              e.currentTarget.currentTime = 0.001;
+            }
+          }}
+          onError={(e) =>
+            e.currentTarget.parentElement?.classList.add("is-failed")
+          }
+          className="absolute inset-0 h-full w-full object-cover"
+        />
+        <div className="absolute inset-0 z-10 flex items-center justify-center bg-black/10 text-3xl text-white/90 drop-shadow">
+          &#9654;
+        </div>
+        <div className="thumb-error absolute inset-0 z-20 hidden items-center justify-center px-3 text-center text-xs font-semibold text-slate-400">
+          Preview unavailable
+        </div>
+      </div>
+    );
+  }
   if (item.media_type !== "image")
     return (
       <div
@@ -2376,10 +2428,17 @@ function App() {
             <div className="grid gap-4 p-4 lg:grid-cols-[1fr_330px]">
               {selected.media_type === "video" ? (
                 <video
-                  src={mediaUrl(selected)}
+                  key={selected.id}
                   controls
+                  preload="metadata"
+                  playsInline
                   className="max-h-[70vh] w-full rounded-2xl bg-black"
-                />
+                >
+                  <source
+                    src={mediaUrl(selected)}
+                    type={videoMimeType(selected)}
+                  />
+                </video>
               ) : (
                 <img
                   src={mediaUrl(selected)}
