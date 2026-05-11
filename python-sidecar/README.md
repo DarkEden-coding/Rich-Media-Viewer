@@ -35,6 +35,12 @@ Embed paths and/or text:
 python -m rich_media_sidecar embed --provider google --model gemini-embedding-2 /path/a.jpg /path/video.mp4 --text "beach sunset"
 ```
 
+Resize large images before remote embedding:
+
+```bash
+python -m rich_media_sidecar embed --provider openrouter --model google/gemini-embedding-2-preview --image-max-width 1024 /path/a.jpg
+```
+
 JSON request form:
 
 ```bash

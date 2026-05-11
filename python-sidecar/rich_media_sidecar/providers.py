@@ -8,10 +8,13 @@ import base64
 import json
 import mimetypes
 import os
+from io import BytesIO
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Protocol
 from urllib import request, error
+
+from PIL import Image
 
 OLLAMA_EMBEDDING_MODELS = [
     "nomic-embed-text",
@@ -76,6 +79,27 @@ def _unsupported(path: Path, provider: str, model: str, message: str) -> Embeddi
     return EmbeddingResult(str(path), provider, [], kind="unsupported", model=model, error=message)
 
 
+def _image_bytes_for_embedding(path: Path, mime: str, max_width: int | None) -> tuple[str, str]:
+    if not max_width or max_width <= 0:
+        return mime, base64.b64encode(path.read_bytes()).decode("ascii")
+    with Image.open(path) as img:
+        if img.width <= max_width:
+            return mime, base64.b64encode(path.read_bytes()).decode("ascii")
+        height = max(1, round(img.height * (max_width / img.width)))
+        resized = img.copy()
+        resized.thumbnail((max_width, height), Image.Resampling.LANCZOS)
+        output = BytesIO()
+        output_mime = mime if mime in {"image/jpeg", "image/png", "image/webp"} else "image/jpeg"
+        format_name = {"image/jpeg": "JPEG", "image/png": "PNG", "image/webp": "WEBP"}[output_mime]
+        if output_mime == "image/jpeg" and resized.mode not in ("RGB", "L"):
+            resized = resized.convert("RGB")
+        elif output_mime in {"image/png", "image/webp"} and resized.mode == "P":
+            resized = resized.convert("RGBA")
+        save_kwargs = {"quality": 85, "optimize": True} if output_mime in {"image/jpeg", "image/webp"} else {"optimize": True}
+        resized.save(output, format=format_name, **save_kwargs)
+        return output_mime, base64.b64encode(output.getvalue()).decode("ascii")
+
+
 class OllamaEmbeddingProvider:
     """Local Ollama embeddings provider.
 
@@ -115,9 +139,10 @@ class GoogleEmbeddingProvider:
 
     name = "google"
 
-    def __init__(self, model: str = GOOGLE_MULTIMODAL_MODEL) -> None:
+    def __init__(self, model: str = GOOGLE_MULTIMODAL_MODEL, image_max_width: int | None = None) -> None:
         self.model = (model or GOOGLE_MULTIMODAL_MODEL).strip()
         self.api_key = os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY") or ""
+        self.image_max_width = image_max_width
 
     def _post(self, payload: dict) -> dict:
         if not self.api_key:
@@ -149,9 +174,14 @@ class GoogleEmbeddingProvider:
         if not mime or (not mime.startswith(GOOGLE_SUPPORTED_MIME_PREFIXES) and mime not in GOOGLE_SUPPORTED_MIME_TYPES):
             return _unsupported(path, self.name, self.model, f"Unsupported media MIME type for Google embeddings: {mime or 'unknown'}.")
         try:
-            data = base64.b64encode(path.read_bytes()).decode("ascii")
+            if mime.startswith("image/"):
+                mime, data = _image_bytes_for_embedding(path, mime, self.image_max_width)
+            else:
+                data = base64.b64encode(path.read_bytes()).decode("ascii")
         except OSError as exc:
             return _unsupported(path, self.name, self.model, f"Failed to read media file: {exc}")
+        except Exception as exc:
+            return _unsupported(path, self.name, self.model, f"Failed to prepare media file: {exc}")
         content = {"parts": [{"inlineData": {"mimeType": mime, "data": data}}]}
         return self._embedding_from_content(content, str(path), mime.split("/", 1)[0])
 
@@ -172,11 +202,12 @@ class OpenRouterEmbeddingProvider:
 
     name = "openrouter"
 
-    def __init__(self, model: str = OPENROUTER_DEFAULT_MODEL) -> None:
+    def __init__(self, model: str = OPENROUTER_DEFAULT_MODEL, image_max_width: int | None = None) -> None:
         self.model = (model or OPENROUTER_DEFAULT_MODEL).strip()
         self.api_key = os.getenv("OPENROUTER_API_KEY", "")
         self.base_url = (os.getenv("OPENROUTER_BASE_URL") or "https://openrouter.ai/api/v1").rstrip("/")
         self.modalities = OPENROUTER_MODEL_MODALITIES.get(self.model, {"text", "image"})
+        self.image_max_width = image_max_width
 
     def _post(self, payload: dict) -> dict:
         if not self.api_key:
@@ -213,9 +244,11 @@ class OpenRouterEmbeddingProvider:
         mime = _guess_mime(path)
         if mime and mime.startswith("image/") and "image" in self.modalities:
             try:
-                data = base64.b64encode(path.read_bytes()).decode("ascii")
+                mime, data = _image_bytes_for_embedding(path, mime, self.image_max_width)
             except OSError as exc:
                 return _unsupported(path, self.name, self.model, f"Failed to read media file: {exc}")
+            except Exception as exc:
+                return _unsupported(path, self.name, self.model, f"Failed to prepare media file: {exc}")
             input_value = [{"content": [{"type": "image_url", "image_url": {"url": f"data:{mime};base64,{data}"}}]}]
             return self._embedding_from_input(input_value, str(path), "image")
         if mime and mime.startswith("image/"):
@@ -226,12 +259,12 @@ class OpenRouterEmbeddingProvider:
         return self._embedding_from_input(text, source or text[:80], "text")
 
 
-def create_provider(name: str, model: str | None = None) -> EmbeddingProvider:
+def create_provider(name: str, model: str | None = None, image_max_width: int | None = None) -> EmbeddingProvider:
     n = name.strip().lower()
     if n == "google":
-        return GoogleEmbeddingProvider(model)
+        return GoogleEmbeddingProvider(model, image_max_width)
     if n == "openrouter":
-        return OpenRouterEmbeddingProvider(model or OPENROUTER_DEFAULT_MODEL)
+        return OpenRouterEmbeddingProvider(model or OPENROUTER_DEFAULT_MODEL, image_max_width)
     if n == "ollama":
         return OllamaEmbeddingProvider(model or "nomic-embed-text")
     raise ValueError(f"Unknown embedding provider: {name}")

@@ -42,6 +42,7 @@ def build_parser() -> argparse.ArgumentParser:
     e.add_argument("--text", action="append", default=[], help="Text to embed; may be repeated")
     e.add_argument("--json", dest="json_payload", help="JSON request: {paths:[], texts:[]}")
     e.add_argument("--workers", type=int, default=max(1, min(4, (os.cpu_count() or 2) // 2)), help="Embedding worker threads; kept low because embedding is computationally expensive")
+    e.add_argument("--image-max-width", type=int, default=None, help="Optional max image pixel width before remote embedding")
 
     cf = sub.add_parser("cluster-faces", help="Detect faces in images and cluster them")
     cf.add_argument("paths", nargs="*", type=Path)
@@ -90,7 +91,9 @@ def main(argv: list[str] | None = None) -> int:
             payload = _payload(args.json_payload)
             paths = [Path(p) for p in payload.get("paths", [])] + list(args.paths)
             texts = list(payload.get("texts", [])) + list(args.text)
-            provider = create_provider(args.provider, args.model)
+            image_max_width = payload.get("image_max_width", args.image_max_width)
+            image_max_width = int(image_max_width) if image_max_width else None
+            provider = create_provider(args.provider, args.model, image_max_width)
             workers = max(1, args.workers)
             write_ok({"provider": provider.name, "workers": workers, "embeddings": embed_paths(paths, provider, workers) + embed_texts(texts, provider, workers)})
             return 0
