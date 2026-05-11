@@ -405,6 +405,13 @@ function scanPercent(p: ScanProgress) {
     ? Math.min(100, Math.max(0, (completed / p.total_files) * 100))
     : 0;
 }
+function scanProgressNotice(p: ScanProgress) {
+  const faceLine =
+    p.faces_total != null && p.faces_total > 0
+      ? ` · faces ${p.faces_done ?? 0}/${p.faces_total}`
+      : "";
+  return `${p.phase}: ${p.scanned_files} scanned, ${p.imported_or_updated} imported${faceLine}`;
+}
 function formatCoord(value: string, fallback = "Not set") {
   const n = Number(value);
   return value.trim() === "" || Number.isNaN(n) ? fallback : n.toFixed(4);
@@ -621,6 +628,11 @@ function App() {
   const activeFilterRef = useRef(emptyFilters);
   const activeSortOrderRef = useRef<SortOrder>("desc");
   const loadingMoreRef = useRef(false);
+  const pendingScanProgressRef = useRef<ScanProgress | null>(null);
+  const scanProgressTimerRef = useRef<ReturnType<typeof setTimeout> | null>(
+    null,
+  );
+  const lastScanProgressFlushRef = useRef(0);
 
   const counts = useMemo(
     () => ({
@@ -865,18 +877,44 @@ function App() {
       ); /* eslint-disable-next-line react-hooks/exhaustive-deps */
   }, []);
   useEffect(() => {
+    const flushScanProgress = () => {
+      const progress = pendingScanProgressRef.current;
+      if (!progress) return;
+      pendingScanProgressRef.current = null;
+      scanProgressTimerRef.current = null;
+      lastScanProgressFlushRef.current = Date.now();
+      setScanProgress(progress);
+      setNotice(scanProgressNotice(progress));
+    };
     const unlisten = listen<ScanProgress>("scan-progress", (e) => {
-      setScanProgress(e.payload);
-      const p = e.payload;
-      const faceLine =
-        p.faces_total != null && p.faces_total > 0
-          ? ` · faces ${p.faces_done ?? 0}/${p.faces_total}`
-          : "";
-      setNotice(
-        `${p.phase}: ${p.scanned_files} scanned, ${p.imported_or_updated} imported${faceLine}`,
-      );
+      pendingScanProgressRef.current = e.payload;
+      if (e.payload.done) {
+        if (scanProgressTimerRef.current) {
+          clearTimeout(scanProgressTimerRef.current);
+          scanProgressTimerRef.current = null;
+        }
+        flushScanProgress();
+        return;
+      }
+      const elapsed = Date.now() - lastScanProgressFlushRef.current;
+      if (elapsed >= 150) {
+        if (scanProgressTimerRef.current) {
+          clearTimeout(scanProgressTimerRef.current);
+          scanProgressTimerRef.current = null;
+        }
+        flushScanProgress();
+      } else if (!scanProgressTimerRef.current) {
+        scanProgressTimerRef.current = setTimeout(
+          flushScanProgress,
+          150 - elapsed,
+        );
+      }
     });
     return () => {
+      if (scanProgressTimerRef.current) {
+        clearTimeout(scanProgressTimerRef.current);
+        scanProgressTimerRef.current = null;
+      }
       unlisten.then((f) => f());
     };
   }, []);
@@ -951,8 +989,10 @@ function App() {
       setNotice(
         `Scan complete: ${summary.imported_or_updated} imported/updated`,
       );
+      setLoading(false);
+      setScanProgress(null);
       await runSearch();
-      await loadGeoPoints();
+      void loadGeoPoints();
     } catch (e) {
       setNotice(`Scan failed: ${String(e)}`);
     } finally {
@@ -1242,7 +1282,7 @@ function App() {
                 Rich Media Viewer
               </h1>
               <p className="mt-3 text-[15px] leading-snug text-slate-400">
-                Local-first media indexing with metadata, faces and embeddings.
+                Local-first media indexing with optional faces and embeddings.
               </p>
               <button
                 onClick={() => setSetupOpen(true)}
@@ -1726,16 +1766,15 @@ function App() {
                       <h3 className="text-lg font-bold">People Recognition</h3>
                     </div>
                     <p className="text-sm text-slate-400 mb-5 leading-relaxed">
-                      After each library scan, faces are detected in the
-                      background (see progress). Use guided setup to name
-                      people, or refresh detections when you add more images.
+                      Library scans only index media metadata. Use Guided Face
+                      Setup or Update face embeddings when you want face
+                      recognition.
                     </p>
 
                     {people.length === 0 ? (
                       <div className="rounded-xl border border-dashed border-white/10 p-6 text-center text-sm text-slate-500">
-                        No people found yet. Run a library scan (faces are
-                        indexed automatically), then name people here or use
-                        Guided Face Setup.
+                        No people found yet. Run Guided Face Setup or Update
+                        face embeddings after indexing your library.
                       </div>
                     ) : (
                       <div className="grid gap-3 sm:grid-cols-2">

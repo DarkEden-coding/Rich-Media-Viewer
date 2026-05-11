@@ -1,7 +1,7 @@
 use rayon::prelude::*;
 use rusqlite::{params, Connection};
 use std::{
-    collections::VecDeque,
+    collections::{HashMap, VecDeque},
     env, fs,
     path::{Path, PathBuf},
     sync::{
@@ -73,8 +73,7 @@ fn is_facetile_image_path(path: &Path) -> bool {
     path.file_name()
         .and_then(|n| n.to_str())
         .is_some_and(|name| {
-            name.len() >= PREFIX.len()
-                && name[..PREFIX.len()].eq_ignore_ascii_case(PREFIX)
+            name.len() >= PREFIX.len() && name[..PREFIX.len()].eq_ignore_ascii_case(PREFIX)
         })
 }
 fn unix_time(t: SystemTime) -> Option<i64> {
@@ -115,6 +114,8 @@ fn discover_files(root: PathBuf, threads: usize, limit: usize) -> (Vec<PathBuf>,
                 active.fetch_sub(1, Ordering::SeqCst);
                 continue;
             };
+            let mut discovered_dirs = Vec::new();
+            let mut discovered_files = Vec::new();
             for e in rd.flatten() {
                 let path = e.path();
                 if is_blacklisted_path(&path) {
@@ -122,7 +123,10 @@ fn discover_files(root: PathBuf, threads: usize, limit: usize) -> (Vec<PathBuf>,
                 }
                 let Ok(ft) = e.file_type() else { continue };
                 if ft.is_dir() {
-                    queue.lock().unwrap().push_back(path)
+                    discovered_dirs.push(path);
+                    if discovered_dirs.len() >= 64 {
+                        queue.lock().unwrap().extend(discovered_dirs.drain(..));
+                    }
                 } else if ft.is_file()
                     && media_type_for_ext(path.extension().and_then(|e| e.to_str())).is_some()
                     && !is_facetile_image_path(&path)
@@ -131,8 +135,17 @@ fn discover_files(root: PathBuf, threads: usize, limit: usize) -> (Vec<PathBuf>,
                     if n >= limit {
                         break;
                     }
-                    files.lock().unwrap().push(path);
+                    discovered_files.push(path);
+                    if discovered_files.len() >= 256 {
+                        files.lock().unwrap().extend(discovered_files.drain(..));
+                    }
                 }
+            }
+            if !discovered_dirs.is_empty() {
+                queue.lock().unwrap().extend(discovered_dirs);
+            }
+            if !discovered_files.is_empty() {
+                files.lock().unwrap().extend(discovered_files);
             }
             active.fetch_sub(1, Ordering::SeqCst);
         }));
@@ -153,6 +166,15 @@ struct Row {
     size: i64,
     created: Option<i64>,
     modified: Option<i64>,
+}
+#[derive(Clone, Copy)]
+struct Fingerprint {
+    size: i64,
+    modified: Option<i64>,
+}
+enum ProcessResult {
+    Changed,
+    Unchanged,
 }
 fn clean_path_string(path: &Path) -> String {
     path.to_string_lossy()
@@ -181,6 +203,29 @@ fn process_file(p: &Path) -> Option<Row> {
         created: md.created().ok().and_then(unix_time),
         modified: md.modified().ok().and_then(unix_time),
     })
+}
+fn process_file_with_cache(
+    p: &Path,
+    existing: &HashMap<String, Fingerprint>,
+) -> Option<ProcessResult> {
+    media_type_for_ext(p.extension().and_then(|e| e.to_str()))?;
+    if is_facetile_image_path(p) {
+        return None;
+    }
+    let md = fs::metadata(p).ok()?;
+    if !md.is_file() {
+        return None;
+    }
+    let path = clean_path_string(p);
+    let modified = md.modified().ok().and_then(unix_time);
+    let size = md.len() as i64;
+    if existing
+        .get(&path)
+        .is_some_and(|known| known.size == size && known.modified == modified)
+    {
+        return Some(ProcessResult::Unchanged);
+    }
+    Some(ProcessResult::Changed)
 }
 
 fn main() {
@@ -241,6 +286,34 @@ fn main() {
     tx.commit().unwrap();
     let t_db = t2.elapsed();
     let total = t0.elapsed();
+    let existing: HashMap<String, Fingerprint> = rows
+        .iter()
+        .map(|r| {
+            (
+                r.path.clone(),
+                Fingerprint {
+                    size: r.size,
+                    modified: r.modified,
+                },
+            )
+        })
+        .collect();
+    let t3 = Instant::now();
+    let warm_results: Vec<ProcessResult> = pool.install(|| {
+        files
+            .par_iter()
+            .filter_map(|p| process_file_with_cache(p, &existing))
+            .collect()
+    });
+    let t_warm_process = t3.elapsed();
+    let warm_changed = warm_results
+        .iter()
+        .filter(|r| matches!(r, ProcessResult::Changed))
+        .count();
+    let warm_unchanged = warm_results
+        .iter()
+        .filter(|r| matches!(r, ProcessResult::Unchanged))
+        .count();
     println!(
         "discovered={} processed={} discovery_errors={}",
         files.len(),
@@ -257,5 +330,12 @@ fn main() {
     println!(
         "files_per_sec={:.1}",
         rows.len() as f64 / total.as_secs_f64()
+    );
+    println!(
+        "warm_process_ms={} warm_changed={} warm_unchanged={} warm_files_per_sec={:.1}",
+        t_warm_process.as_millis(),
+        warm_changed,
+        warm_unchanged,
+        warm_results.len() as f64 / t_warm_process.as_secs_f64()
     );
 }

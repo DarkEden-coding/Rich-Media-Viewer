@@ -106,23 +106,16 @@ const BLACKLISTED_FOLDER_NAMES: &[&str] = &[
     ".temporaryitems",
     ".trashes",
 ];
-fn is_blacklisted_path(path: &Path) -> bool {
+fn is_excluded_path(path: &Path) -> bool {
     path.components().any(|c| {
         c.as_os_str()
             .to_str()
             .map(|s| {
-                BLACKLISTED_FOLDER_NAMES
-                    .iter()
-                    .any(|b| s.eq_ignore_ascii_case(b))
+                s.starts_with('.')
+                    || BLACKLISTED_FOLDER_NAMES
+                        .iter()
+                        .any(|b| s.eq_ignore_ascii_case(b))
             })
-            .unwrap_or(false)
-    })
-}
-fn is_dotfile_path(path: &Path) -> bool {
-    path.components().any(|c| {
-        c.as_os_str()
-            .to_str()
-            .map(|s| s.starts_with('.'))
             .unwrap_or(false)
     })
 }
@@ -135,8 +128,7 @@ fn is_facetile_image_path(path: &Path) -> bool {
     path.file_name()
         .and_then(|n| n.to_str())
         .is_some_and(|name| {
-            name.len() >= PREFIX.len()
-                && name[..PREFIX.len()].eq_ignore_ascii_case(PREFIX)
+            name.len() >= PREFIX.len() && name[..PREFIX.len()].eq_ignore_ascii_case(PREFIX)
         })
 }
 fn sql_path_not_blacklisted_clause() -> String {
@@ -349,6 +341,16 @@ fn clean_path_str(s: &str) -> String {
 fn clean_path_string(path: &Path) -> String {
     clean_path_str(&path.to_string_lossy())
 }
+#[derive(Debug, Clone, Copy)]
+struct MediaFingerprint {
+    size_bytes: Option<i64>,
+    modified_at: Option<i64>,
+}
+#[derive(Debug)]
+enum MediaIndexResult {
+    Upsert(MediaItem),
+    Unchanged,
+}
 fn media_type_for_ext(ext: Option<&str>) -> Option<&'static str> {
     match ext
         .unwrap_or_default()
@@ -424,8 +426,11 @@ fn parse_exif(
     .ok();
     (make, model, lens, dt, lat, lng, json)
 }
-fn media_from_path(path: &Path) -> Result<Option<MediaItem>, String> {
-    if is_blacklisted_path(path) || is_dotfile_path(path) {
+fn media_from_path_with_existing(
+    path: &Path,
+    existing: Option<&HashMap<String, MediaFingerprint>>,
+) -> Result<Option<MediaIndexResult>, String> {
+    if is_excluded_path(path) {
         return Ok(None);
     }
     let ext = path
@@ -444,14 +449,21 @@ fn media_from_path(path: &Path) -> Result<Option<MediaItem>, String> {
     };
     let modified_at = md.modified().ok().and_then(unix_time);
     let size_bytes = Some(md.len() as i64);
+    let path_string = clean_path_string(path);
+    if existing
+        .and_then(|known| known.get(&path_string))
+        .is_some_and(|known| known.size_bytes == size_bytes && known.modified_at == modified_at)
+    {
+        return Ok(Some(MediaIndexResult::Unchanged));
+    }
     let (mk, mo, lens, cap, lat, lng, mjson) = if mt == "image" {
         parse_exif(path)
     } else {
         (None, None, None, None, None, None, None)
     };
-    Ok(Some(MediaItem {
+    Ok(Some(MediaIndexResult::Upsert(MediaItem {
         id: 0,
-        path: clean_path_string(path),
+        path: path_string,
         file_name: path
             .file_name()
             .and_then(|n| n.to_str())
@@ -471,11 +483,35 @@ fn media_from_path(path: &Path) -> Result<Option<MediaItem>, String> {
         latitude: lat,
         longitude: lng,
         metadata_json: mjson,
-    }))
+    })))
 }
 fn upsert_media(conn: &Connection, item: &MediaItem) -> Result<(), String> {
     conn.execute(r#"INSERT INTO media_items(path,file_name,extension,media_type,size_bytes,created_at,modified_at,imported_at,missing,camera_make,camera_model,lens_model,captured_at,latitude,longitude,metadata_json) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,0,?9,?10,?11,?12,?13,?14,?15) ON CONFLICT(path) DO UPDATE SET file_name=excluded.file_name,extension=excluded.extension,media_type=excluded.media_type,size_bytes=excluded.size_bytes,created_at=excluded.created_at,modified_at=excluded.modified_at,missing=0,camera_make=excluded.camera_make,camera_model=excluded.camera_model,lens_model=excluded.lens_model,captured_at=excluded.captured_at,latitude=excluded.latitude,longitude=excluded.longitude,metadata_json=excluded.metadata_json"#,params![item.path,item.file_name,item.extension,item.media_type,item.size_bytes,item.created_at,item.modified_at,item.imported_at,item.camera_make,item.camera_model,item.lens_model,item.captured_at,item.latitude,item.longitude,item.metadata_json]).map_err(|e|format!("failed to upsert media item: {e}"))?;
     Ok(())
+}
+fn load_existing_media_fingerprints(
+    conn: &Connection,
+) -> Result<HashMap<String, MediaFingerprint>, String> {
+    let mut stmt = conn
+        .prepare("SELECT path,size_bytes,modified_at FROM media_items WHERE missing=0")
+        .map_err(|e| format!("failed to prepare existing media lookup: {e}"))?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                MediaFingerprint {
+                    size_bytes: row.get(1)?,
+                    modified_at: row.get(2)?,
+                },
+            ))
+        })
+        .map_err(|e| format!("failed to query existing media lookup: {e}"))?;
+    let mut out = HashMap::new();
+    for row in rows {
+        let (path, fingerprint) = row.map_err(|e| e.to_string())?;
+        out.insert(path, fingerprint);
+    }
+    Ok(out)
 }
 const MEDIA_SELECT:&str="SELECT id,path,file_name,extension,media_type,size_bytes,created_at,modified_at,imported_at,missing,camera_make,camera_model,lens_model,captured_at,latitude,longitude,metadata_json FROM media_items";
 fn row_to_media(row: &rusqlite::Row<'_>) -> rusqlite::Result<MediaItem> {
@@ -666,6 +702,8 @@ fn discover_files(
                     continue;
                 }
             };
+            let mut discovered_dirs = Vec::new();
+            let mut discovered_files = Vec::new();
             for entry in read_dir {
                 let entry = match entry {
                     Ok(e) => e,
@@ -678,11 +716,14 @@ fn discover_files(
                 };
                 let path = entry.path();
                 let Ok(ft) = entry.file_type() else { continue };
-                if is_blacklisted_path(&path) || is_dotfile_path(&path) {
+                if is_excluded_path(&path) {
                     continue;
                 }
                 if ft.is_dir() {
-                    queue.lock().unwrap().push_back(path)
+                    discovered_dirs.push(path);
+                    if discovered_dirs.len() >= 64 {
+                        queue.lock().unwrap().extend(discovered_dirs.drain(..));
+                    }
                 } else if ft.is_file() {
                     let ext = path.extension().and_then(|e| e.to_str());
                     if media_type_for_ext(ext).is_none() {
@@ -695,8 +736,17 @@ fn discover_files(
                     if max_files.is_some_and(|limit| n >= limit) {
                         break;
                     }
-                    files.lock().unwrap().push(path)
+                    discovered_files.push(path);
+                    if discovered_files.len() >= 256 {
+                        files.lock().unwrap().extend(discovered_files.drain(..));
+                    }
                 }
+            }
+            if !discovered_dirs.is_empty() {
+                queue.lock().unwrap().extend(discovered_dirs);
+            }
+            if !discovered_files.is_empty() {
+                files.lock().unwrap().extend(discovered_files);
             }
             active.fetch_sub(1, Ordering::SeqCst);
         }));
@@ -778,9 +828,17 @@ fn run_face_embedding_index_phase(
     sum: &mut ScanSummary,
     discovered_files: usize,
     total_files: Option<usize>,
+    media_ids: Option<Vec<i64>>,
 ) -> Result<(), String> {
     let conn = open_db(app)?;
-    let media_ids = list_image_media_ids(&conn)?;
+    let media_ids = if let Some(ids) = media_ids {
+        media_paths_for_ids(&conn, Some(ids), true)?
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect()
+    } else {
+        list_image_media_ids(&conn)?
+    };
     let total_face = media_ids.len();
     let face_threads = face_indexing_thread_count();
     if total_face == 0 {
@@ -885,6 +943,7 @@ fn scan_library_impl(app: tauri::AppHandle, paths: Vec<String>) -> Result<ScanSu
     const PROGRESS_FILES_PER_INDEXING_THREAD: usize = 20;
 
     let mut conn = open_db(&app)?;
+    let existing_fingerprints = Arc::new(load_existing_media_fingerprints(&conn)?);
     let mut sum = ScanSummary {
         scanned_files: 0,
         imported_or_updated: 0,
@@ -1000,10 +1059,17 @@ fn scan_library_impl(app: tauri::AppHandle, paths: Vec<String>) -> Result<ScanSu
             })?;
         let (tx, rx) = mpsc::channel();
         let mut pending_progress_path = files.first().cloned();
+        let existing_fingerprints_for_indexing = Arc::clone(&existing_fingerprints);
         let indexing_handle = thread::spawn(move || {
             pool.install(|| {
                 files.par_iter().for_each_with(tx, |tx, p| {
-                    let _ = tx.send((p.clone(), media_from_path(p)));
+                    let _ = tx.send((
+                        p.clone(),
+                        media_from_path_with_existing(
+                            p,
+                            Some(existing_fingerprints_for_indexing.as_ref()),
+                        ),
+                    ));
                 })
             })
         });
@@ -1015,12 +1081,9 @@ fn scan_library_impl(app: tauri::AppHandle, paths: Vec<String>) -> Result<ScanSu
             results += 1;
             sum.scanned_files += 1;
             pending_progress_path = Some(scan_path.clone());
-            match res.and_then(|o| {
-                if let Some(i) = o {
-                    upsert_media(&tx_db, &i).map(|_| true)
-                } else {
-                    Ok(false)
-                }
+            match res.and_then(|o| match o {
+                Some(MediaIndexResult::Upsert(i)) => upsert_media(&tx_db, &i).map(|_| true),
+                Some(MediaIndexResult::Unchanged) | None => Ok(false),
             }) {
                 Ok(true) => sum.imported_or_updated += 1,
                 Ok(false) => sum.skipped_files += 1,
@@ -1081,7 +1144,6 @@ fn scan_library_impl(app: tauri::AppHandle, paths: Vec<String>) -> Result<ScanSu
     );
     backend_log("checking missing files");
     sum.missing_marked = mark_missing_internal(&conn)?;
-    run_face_embedding_index_phase(&app, &mut sum, discovered_files, total_files)?;
     backend_log(&format!(
         "scan complete scanned={} imported_or_updated={} skipped={} missing_marked={} errors={}",
         sum.scanned_files,
@@ -1136,7 +1198,7 @@ async fn update_face_embeddings(app: tauri::AppHandle) -> Result<ScanSummary, St
             None,
             false,
         );
-        run_face_embedding_index_phase(&app, &mut sum, discovered_files, total_files)?;
+        run_face_embedding_index_phase(&app, &mut sum, discovered_files, total_files, None)?;
         emit_scan_progress(
             &app,
             &sum,
