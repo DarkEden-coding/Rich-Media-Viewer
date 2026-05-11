@@ -7,6 +7,7 @@ import {
   useMemo,
   useRef,
   useState,
+  type UIEvent,
 } from "react";
 
 type AppInfo = {
@@ -281,7 +282,7 @@ const embeddingModelsByProvider: Record<string, string[]> = {
   google: googleEmbeddingModels,
   openrouter: openRouterEmbeddingModels,
 };
-const PAGE_SIZE = 500;
+const PAGE_SIZE = 120;
 
 function formatBytes(bytes?: number | null) {
   if (!bytes) return "—";
@@ -348,14 +349,6 @@ const LazyMediaThumb = memo(function LazyMediaThumb({
   item: MediaItem;
   view: ViewMode;
 }) {
-  const [loaded, setLoaded] = useState(false);
-  const [failed, setFailed] = useState(false);
-
-  useEffect(() => {
-    setLoaded(false);
-    setFailed(false);
-  }, [item.id]);
-
   const sizeClass =
     view === "grid" ? "h-44 w-full" : "h-20 w-28 shrink-0 rounded-xl";
   if (item.media_type !== "image")
@@ -376,20 +369,14 @@ const LazyMediaThumb = memo(function LazyMediaThumb({
           loading="lazy"
           decoding="async"
           fetchPriority="low"
-          onLoad={() => setLoaded(true)}
-          onError={() => setFailed(true)}
-          className={`absolute inset-0 h-full w-full object-cover transition-opacity duration-200 ${loaded ? "opacity-100" : "opacity-0"}`}
+          onError={(e) =>
+            e.currentTarget.parentElement?.classList.add("is-failed")
+          }
+          className="absolute inset-0 h-full w-full object-cover"
         />
-      {!loaded && !failed && (
-        <div className="absolute inset-0 z-10 flex items-center justify-center text-xs font-semibold uppercase tracking-[0.18em] text-slate-400">
-          Loading
-        </div>
-      )}
-      {failed && (
-        <div className="absolute inset-0 z-10 flex items-center justify-center px-3 text-center text-xs font-semibold text-slate-400">
-          Preview unavailable
-        </div>
-      )}
+      <div className="thumb-error absolute inset-0 z-10 hidden items-center justify-center px-3 text-center text-xs font-semibold text-slate-400">
+        Preview unavailable
+      </div>
     </div>
   );
 });
@@ -415,6 +402,7 @@ function App() {
   const [filters, setFilters] = useState(emptyFilters);
   const [people, setPeople] = useState<Person[]>([]);
   const [items, setItems] = useState<MediaItem[]>([]);
+  const [hasMoreItems, setHasMoreItems] = useState(true);
   const [selected, setSelected] = useState<MediaItem | null>(null);
   const [view, setView] = useState<ViewMode>("grid");
   const [loading, setLoading] = useState(false);
@@ -432,8 +420,12 @@ function App() {
     width: number;
     height: number;
   } | null>(null);
+  const scrollerRef = useRef<HTMLDivElement | null>(null);
   const faceRequestRef = useRef(0);
   const searchRequestRef = useRef(0);
+  const searchOffsetRef = useRef(0);
+  const activeFilterRef = useRef(emptyFilters);
+  const loadingMoreRef = useRef(false);
 
   const counts = useMemo(
     () => ({
@@ -466,8 +458,31 @@ function App() {
       /* no people yet */
     }
   }
+  function buildSearchFilter(next = filters, offset = 0) {
+    return {
+      query: next.query || undefined,
+      media_type: next.mediaType || undefined,
+      missing: next.missing === "" ? undefined : next.missing === "true",
+      from_ts: dateToEpoch(next.from),
+      to_ts: dateToEpoch(next.to, true),
+      camera: next.camera || undefined,
+      lat: num(next.lat),
+      lng: num(next.lng),
+      radius_km: num(next.radius),
+      person_id: num(next.personId),
+      person_name: next.personName || undefined,
+      has_gps: next.hasGps === "" ? undefined : next.hasGps === "true",
+      has_camera: next.hasCamera === "" ? undefined : next.hasCamera === "true",
+      limit: PAGE_SIZE,
+      offset,
+    };
+  }
   async function runSearch(next = filters) {
     const requestId = ++searchRequestRef.current;
+    activeFilterRef.current = next;
+    searchOffsetRef.current = 0;
+    loadingMoreRef.current = false;
+    setHasMoreItems(true);
     setLoading(true);
     try {
       if (next.query.trim()) {
@@ -485,6 +500,8 @@ function App() {
             const result = semantic.map((hit) => hit.item);
             if (requestId !== searchRequestRef.current) return;
             setItems(result);
+            searchOffsetRef.current = result.length;
+            setHasMoreItems(false);
             setNotice(
               `Semantic search found ${result.length} embedded matches`,
             );
@@ -494,45 +511,49 @@ function App() {
           /* no embeddings yet or provider unavailable; continue with metadata search */
         }
       }
-      const baseFilter = {
-        query: next.query || undefined,
-        media_type: next.mediaType || undefined,
-        missing: next.missing === "" ? undefined : next.missing === "true",
-        from_ts: dateToEpoch(next.from),
-        to_ts: dateToEpoch(next.to, true),
-        camera: next.camera || undefined,
-        lat: num(next.lat),
-        lng: num(next.lng),
-        radius_km: num(next.radius),
-        person_id: num(next.personId),
-        person_name: next.personName || undefined,
-        has_gps: next.hasGps === "" ? undefined : next.hasGps === "true",
-        has_camera:
-          next.hasCamera === "" ? undefined : next.hasCamera === "true",
-      };
-      let loadedCount = 0;
-      let pageOffset = 0;
       setItems([]);
-      while (true) {
-        const result = await invoke<MediaItem[]>("search_media", {
-          filter: { ...baseFilter, limit: PAGE_SIZE, offset: pageOffset },
-        });
-        if (requestId !== searchRequestRef.current) return;
-        startTransition(() => setItems((prev) => [...prev, ...result]));
-        loadedCount += result.length;
-        setNotice(`${loadedCount} media item names loaded`);
-        if (result.length < PAGE_SIZE) {
-          break;
-        }
-        pageOffset += result.length;
-        await new Promise((resolve) => setTimeout(resolve, 0));
-      }
+      const result = await invoke<MediaItem[]>("search_media", {
+        filter: buildSearchFilter(next, 0),
+      });
+      if (requestId !== searchRequestRef.current) return;
+      searchOffsetRef.current = result.length;
+      setItems(result);
+      setHasMoreItems(result.length === PAGE_SIZE);
+      setNotice(`${result.length} nearby media item names loaded`);
     } catch (error) {
       if (requestId !== searchRequestRef.current) return;
       setNotice(`Search unavailable: ${String(error)}`);
     } finally {
       if (requestId === searchRequestRef.current) setLoading(false);
     }
+  }
+  async function loadMoreItems() {
+    if (loadingMoreRef.current || !hasMoreItems) return;
+    const requestId = searchRequestRef.current;
+    const offset = searchOffsetRef.current;
+    loadingMoreRef.current = true;
+    try {
+      const result = await invoke<MediaItem[]>("search_media", {
+        filter: buildSearchFilter(activeFilterRef.current, offset),
+      });
+      if (requestId !== searchRequestRef.current) return;
+      searchOffsetRef.current = offset + result.length;
+      startTransition(() => setItems((prev) => [...prev, ...result]));
+      setHasMoreItems(result.length === PAGE_SIZE);
+      if (result.length) {
+        setNotice(`${offset + result.length} media item names loaded`);
+      }
+    } catch (error) {
+      if (requestId !== searchRequestRef.current) return;
+      setNotice(`Search unavailable: ${String(error)}`);
+    } finally {
+      if (requestId === searchRequestRef.current) loadingMoreRef.current = false;
+    }
+  }
+  function maybeLoadMore(e: UIEvent<HTMLDivElement>) {
+    const el = e.currentTarget;
+    if (el.scrollHeight - el.scrollTop - el.clientHeight < 1600)
+      void loadMoreItems();
   }
   useEffect(() => {
     invoke<AppInfo>("initialize_app")
@@ -644,6 +665,7 @@ function App() {
       setSelected(null);
       setScan(null);
       setScanProgress(null);
+      setHasMoreItems(false);
       setNotice(
         "Index database deleted. Add folders and scan to rebuild it.",
       );
@@ -1042,7 +1064,11 @@ function App() {
             </div>
           )}
           <div className="divider-line -ml-5 -mr-8 mb-3 shrink-0" />
-          <div className="flex min-h-0 flex-1 flex-col overflow-y-auto">
+          <div
+            ref={scrollerRef}
+            onScroll={maybeLoadMore}
+            className="flex min-h-0 flex-1 flex-col overflow-y-auto"
+          >
             {items.length === 0 ? (
               <div className="flex flex-1 flex-col items-center justify-center gap-4 py-10 text-center">
                 <div className="empty-orb text-7xl">{icons.box}</div>
@@ -1063,7 +1089,7 @@ function App() {
                       : "space-y-3 pb-4"
                   }
                 >
-                  {items.map((item) => (
+                {items.map((item) => (
                     <button
                       key={item.id}
                       onClick={() => openItem(item)}
@@ -1171,9 +1197,14 @@ function App() {
                               Remove
                             </button>
                           </div>
-                        ))}
-                      </div>
-                    )}
+                ))}
+                {hasMoreItems && (
+                  <div className="col-span-full py-4 text-center text-xs font-semibold uppercase tracking-[0.2em] text-slate-500">
+                    More media loads as you scroll
+                  </div>
+                )}
+              </div>
+            )}
                   </section>
 
                   <section className="glass-panel rounded-2xl p-6 border border-white/[0.04]">

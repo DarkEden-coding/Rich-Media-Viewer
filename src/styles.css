@@ -102,25 +102,19 @@ button { cursor: pointer; }
 
 .divider-line { border-top: 1px solid rgba(148,163,184,.10); }
 
-.media-card {
-  content-visibility: auto;
-  contain-intrinsic-size: 260px 230px;
-}
-
 .thumb-placeholder::before {
   content: '';
   position: absolute;
   inset: 0;
-  background:
-    linear-gradient(110deg, transparent 0%, rgba(255,255,255,.08) 45%, transparent 70%),
-    linear-gradient(145deg, rgba(30,41,59,.9), rgba(15,23,42,.95));
-  background-size: 220% 100%, 100% 100%;
-  animation: thumb-shimmer 1.3s ease-in-out infinite;
+  background: linear-gradient(145deg, rgba(30,41,59,.9), rgba(15,23,42,.95));
 }
 
-@keyframes thumb-shimmer {
-  from { background-position: 180% 0, 0 0; }
-  to { background-position: -80% 0, 0 0; }
+.thumb-placeholder.is-failed img {
+  display: none;
+}
+
+.thumb-placeholder.is-failed .thumb-error {
+  display: flex;
 }
 
 .custom-scrollbar::-webkit-scrollbar {
