@@ -126,12 +126,26 @@ fn is_dotfile_path(path: &Path) -> bool {
             .unwrap_or(false)
     })
 }
+/// Google Photos-style face preview tiles (`facetile*.jpg`, etc.): omit from indexing and UI lists.
+fn is_facetile_image_path(path: &Path) -> bool {
+    if media_type_for_ext(path.extension().and_then(|e| e.to_str())) != Some("image") {
+        return false;
+    }
+    const PREFIX: &str = "facetile";
+    path.file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|name| {
+            name.len() >= PREFIX.len()
+                && name[..PREFIX.len()].eq_ignore_ascii_case(PREFIX)
+        })
+}
 fn sql_path_not_blacklisted_clause() -> String {
     let mut clause: String = BLACKLISTED_FOLDER_NAMES
         .iter()
         .map(|name| format!(" AND lower(path) NOT LIKE '%{}%'", name.replace("'", "''")))
         .collect();
     clause.push_str(" AND file_name NOT LIKE '.%'");
+    clause.push_str(" AND (media_type != 'image' OR lower(file_name) NOT LIKE 'facetile%')");
     clause
 }
 
@@ -421,6 +435,9 @@ fn media_from_path(path: &Path) -> Result<Option<MediaItem>, String> {
     let Some(mt) = media_type_for_ext(ext.as_deref()) else {
         return Ok(None);
     };
+    if is_facetile_image_path(path) {
+        return Ok(None);
+    }
     let md = fs::metadata(path).map_err(|e| format!("{}: {e}", path.display()))?;
     if !md.is_file() {
         return Ok(None);
@@ -669,6 +686,9 @@ fn discover_files(
                 } else if ft.is_file() {
                     let ext = path.extension().and_then(|e| e.to_str());
                     if media_type_for_ext(ext).is_none() {
+                        continue;
+                    }
+                    if is_facetile_image_path(&path) {
                         continue;
                     }
                     let n = found.fetch_add(1, Ordering::Relaxed);
@@ -1310,7 +1330,7 @@ fn list_geo_points(app: tauri::AppHandle) -> Result<Vec<GeoPoint>, String> {
     let c = open_db(&app)?;
     let mut s = c
         .prepare(
-            "SELECT latitude,longitude FROM media_items WHERE media_type='image' AND missing=0 AND latitude IS NOT NULL AND longitude IS NOT NULL",
+            "SELECT latitude,longitude FROM media_items WHERE media_type='image' AND missing=0 AND latitude IS NOT NULL AND longitude IS NOT NULL AND lower(file_name) NOT LIKE 'facetile%'",
         )
         .map_err(|e| e.to_string())?;
     let points = s

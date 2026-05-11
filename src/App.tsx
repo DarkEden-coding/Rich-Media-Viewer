@@ -594,6 +594,8 @@ function App() {
   const [loading, setLoading] = useState(false);
   const [scan, setScan] = useState<ScanSummary | null>(null);
   const [scanProgress, setScanProgress] = useState<ScanProgress | null>(null);
+  const [semanticSearchOverlayVisible, setSemanticSearchOverlayVisible] =
+    useState(false);
   const [notice, setNotice] = useState("Starting Rich Media Viewer…");
   const [rename, setRename] = useState<Record<number, string>>({});
   const [faceSetupOpen, setFaceSetupOpen] = useState(false);
@@ -712,8 +714,15 @@ function App() {
     loadingMoreRef.current = false;
     setHasMoreItems(true);
     setLoading(true);
+    setSemanticSearchOverlayVisible(false);
+    let semanticProgressTimer: ReturnType<typeof setTimeout> | null = null;
     try {
       if (next.query.trim()) {
+        semanticProgressTimer = setTimeout(() => {
+          if (requestId === searchRequestRef.current) {
+            setSemanticSearchOverlayVisible(true);
+          }
+        }, 250);
         try {
           const semantic = await invoke<{ item: MediaItem; score: number }[]>(
             "search_semantic_text",
@@ -724,11 +733,16 @@ function App() {
               limit: 120,
             },
           );
+          if (semanticProgressTimer) {
+            clearTimeout(semanticProgressTimer);
+            semanticProgressTimer = null;
+          }
           if (semantic.length) {
             const result = semantic
               .map((hit) => hit.item)
               .sort((a, b) => compareMediaByDate(a, b, order));
             if (requestId !== searchRequestRef.current) return;
+            setSemanticSearchOverlayVisible(false);
             setItems(result);
             searchOffsetRef.current = result.length;
             setHasMoreItems(false);
@@ -738,8 +752,13 @@ function App() {
             return;
           }
         } catch {
+          if (semanticProgressTimer) {
+            clearTimeout(semanticProgressTimer);
+            semanticProgressTimer = null;
+          }
           /* no embeddings yet or provider unavailable; continue with metadata search */
         }
+        setSemanticSearchOverlayVisible(false);
       }
       setItems([]);
       const result = await invoke<MediaItem[]>("search_media", {
@@ -754,7 +773,11 @@ function App() {
       if (requestId !== searchRequestRef.current) return;
       setNotice(`Search unavailable: ${String(error)}`);
     } finally {
-      if (requestId === searchRequestRef.current) setLoading(false);
+      if (semanticProgressTimer) clearTimeout(semanticProgressTimer);
+      if (requestId === searchRequestRef.current) {
+        setLoading(false);
+        setSemanticSearchOverlayVisible(false);
+      }
     }
   }
   async function loadMoreItems() {
@@ -1461,11 +1484,30 @@ function App() {
             </div>
           )}
           <div className="divider-line -ml-5 -mr-8 mb-3 shrink-0" />
-          <div
-            ref={scrollerRef}
-            onScroll={maybeLoadMore}
-            className="flex min-h-0 flex-1 flex-col overflow-y-auto"
-          >
+          <div className="relative min-h-0 flex flex-1 flex-col">
+            {semanticSearchOverlayVisible && (
+              <div className="absolute inset-0 z-20 flex items-start justify-center overflow-hidden bg-slate-950/55 p-6 pt-10 backdrop-blur-[2px]">
+                <div
+                  role="status"
+                  aria-live="polite"
+                  aria-busy="true"
+                  className="glass-panel flex flex-col items-center gap-4 rounded-2xl border border-blue-400/25 px-8 py-7 shadow-xl"
+                >
+                  <div
+                    className="h-11 w-11 shrink-0 animate-spin rounded-full border-2 border-blue-400/25 border-t-blue-400"
+                    aria-hidden
+                  />
+                  <p className="text-center text-base font-semibold text-slate-100">
+                    Searching Images
+                  </p>
+                </div>
+              </div>
+            )}
+            <div
+              ref={scrollerRef}
+              onScroll={maybeLoadMore}
+              className="flex min-h-0 flex-1 flex-col overflow-y-auto"
+            >
             {items.length === 0 ? (
               <div className="flex flex-1 flex-col items-center justify-center gap-4 py-10 text-center">
                 <div className="empty-orb text-7xl">{icons.box}</div>
@@ -1537,6 +1579,7 @@ function App() {
                 )}
               </div>
             )}
+            </div>
           </div>
         </section>
       </div>

@@ -65,6 +65,18 @@ fn media_type_for_ext(ext: Option<&str>) -> Option<&'static str> {
         _ => None,
     }
 }
+fn is_facetile_image_path(path: &Path) -> bool {
+    if media_type_for_ext(path.extension().and_then(|e| e.to_str())) != Some("image") {
+        return false;
+    }
+    const PREFIX: &str = "facetile";
+    path.file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|name| {
+            name.len() >= PREFIX.len()
+                && name[..PREFIX.len()].eq_ignore_ascii_case(PREFIX)
+        })
+}
 fn unix_time(t: SystemTime) -> Option<i64> {
     t.duration_since(UNIX_EPOCH)
         .ok()
@@ -113,6 +125,7 @@ fn discover_files(root: PathBuf, threads: usize, limit: usize) -> (Vec<PathBuf>,
                     queue.lock().unwrap().push_back(path)
                 } else if ft.is_file()
                     && media_type_for_ext(path.extension().and_then(|e| e.to_str())).is_some()
+                    && !is_facetile_image_path(&path)
                 {
                     let n = found.fetch_add(1, Ordering::Relaxed);
                     if n >= limit {
@@ -152,6 +165,9 @@ fn process_file(p: &Path) -> Option<Row> {
         .and_then(|e| e.to_str())
         .map(|s| s.to_ascii_lowercase());
     let mt = media_type_for_ext(ext.as_deref())?;
+    if is_facetile_image_path(p) {
+        return None;
+    }
     let md = fs::metadata(p).ok()?;
     if !md.is_file() {
         return None;
