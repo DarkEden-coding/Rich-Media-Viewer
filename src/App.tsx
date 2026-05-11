@@ -84,7 +84,8 @@ type ViewMode = "grid" | "list";
 type SortOrder = "desc" | "asc";
 
 const emptyFilters = {
-  query: "",
+  fileNameQuery: "",
+  semanticQuery: "",
   mediaType: "",
   missing: "",
   from: "",
@@ -687,8 +688,9 @@ function App() {
     void runSearch(next);
   }
   function buildSearchFilter(next = filters, offset = 0, order = sortOrder) {
+    const fq = next.fileNameQuery.trim();
     return {
-      query: next.query || undefined,
+      query: fq || undefined,
       media_type: next.mediaType || undefined,
       missing: next.missing === "" ? undefined : next.missing === "true",
       from_ts: dateToEpoch(next.from),
@@ -716,8 +718,10 @@ function App() {
     setLoading(true);
     setSemanticSearchOverlayVisible(false);
     let semanticProgressTimer: ReturnType<typeof setTimeout> | null = null;
+    const fileQ = next.fileNameQuery.trim();
+    const semQ = next.semanticQuery.trim();
     try {
-      if (next.query.trim()) {
+      if (semQ) {
         semanticProgressTimer = setTimeout(() => {
           if (requestId === searchRequestRef.current) {
             setSemanticSearchOverlayVisible(true);
@@ -727,7 +731,7 @@ function App() {
           const semantic = await invoke<{ item: MediaItem; score: number }[]>(
             "search_semantic_text",
             {
-              query: next.query.trim(),
+              query: semQ,
               provider,
               model: embeddingModel,
               limit: 120,
@@ -737,26 +741,51 @@ function App() {
             clearTimeout(semanticProgressTimer);
             semanticProgressTimer = null;
           }
-          if (semantic.length) {
-            const result = semantic
-              .map((hit) => hit.item)
-              .sort((a, b) => compareMediaByDate(a, b, order));
-            if (requestId !== searchRequestRef.current) return;
-            setSemanticSearchOverlayVisible(false);
-            setItems(result);
-            searchOffsetRef.current = result.length;
-            setHasMoreItems(false);
-            setNotice(
-              `Semantic search found ${result.length} embedded matches`,
+          let result = semantic.map((hit) => hit.item);
+          if (fileQ) {
+            const fl = fileQ.toLowerCase();
+            result = result.filter(
+              (item) =>
+                item.file_name.toLowerCase().includes(fl) ||
+                item.path.toLowerCase().includes(fl),
             );
-            return;
           }
+          result.sort((a, b) => compareMediaByDate(a, b, order));
+          if (requestId !== searchRequestRef.current) return;
+          setSemanticSearchOverlayVisible(false);
+          setItems(result);
+          searchOffsetRef.current = result.length;
+          setHasMoreItems(false);
+          if (fileQ) {
+            setNotice(
+              result.length
+                ? `${result.length} semantic matches after filename filter`
+                : "No semantic matches also match the filename filter",
+            );
+          } else {
+            setNotice(
+              result.length
+                ? `Semantic search found ${result.length} embedded matches`
+                : "No close semantic matches for that description",
+            );
+          }
+          return;
         } catch {
           if (semanticProgressTimer) {
             clearTimeout(semanticProgressTimer);
             semanticProgressTimer = null;
           }
-          /* no embeddings yet or provider unavailable; continue with metadata search */
+          if (!fileQ) {
+            if (requestId !== searchRequestRef.current) return;
+            setSemanticSearchOverlayVisible(false);
+            setItems([]);
+            searchOffsetRef.current = 0;
+            setHasMoreItems(false);
+            setNotice(
+              "Semantic search unavailable (embeddings or provider issue)",
+            );
+            return;
+          }
         }
         setSemanticSearchOverlayVisible(false);
       }
@@ -768,7 +797,11 @@ function App() {
       searchOffsetRef.current = result.length;
       setItems(result);
       setHasMoreItems(result.length === PAGE_SIZE);
-      setNotice(`${result.length} nearby media item names loaded`);
+      setNotice(
+        fileQ
+          ? `${result.length} media items matching filename / path`
+          : `${result.length} nearby media items loaded`,
+      );
     } catch (error) {
       if (requestId !== searchRequestRef.current) return;
       setNotice(`Search unavailable: ${String(error)}`);
@@ -798,7 +831,7 @@ function App() {
       startTransition(() => setItems((prev) => [...prev, ...result]));
       setHasMoreItems(result.length === PAGE_SIZE);
       if (result.length) {
-        setNotice(`${offset + result.length} media item names loaded`);
+        setNotice(`${offset + result.length} media items loaded`);
       }
     } catch (error) {
       if (requestId !== searchRequestRef.current) return;
@@ -1223,17 +1256,32 @@ function App() {
               </button>
               <section className="glass-panel mt-5 rounded-xl p-4">
                 <label>
-                  <span className="label">Semantic / filename query</span>
+                  <span className="label">Describe content (semantic)</span>
                   <input
-                    value={filters.query}
-                    onChange={(e) => updateFilter("query", e.target.value)}
-                    placeholder="sunset beach, dog, receipt..."
+                    value={filters.semanticQuery}
+                    onChange={(e) =>
+                      updateFilter("semanticQuery", e.target.value)
+                    }
+                    placeholder="sunset beach, dog, receipt…"
+                    className="field"
+                  />
+                </label>
+                <label className="mt-4 block">
+                  <span className="label">File name / path</span>
+                  <input
+                    value={filters.fileNameQuery}
+                    onChange={(e) =>
+                      updateFilter("fileNameQuery", e.target.value)
+                    }
+                    placeholder="IMG_2024, vacation, .mp4…"
                     className="field"
                   />
                 </label>
                 <p className="mt-2 text-xs text-slate-400">
-                  Uses semantic vector search when embeddings exist, then falls
-                  back to filename/path matching.
+                  Semantic search uses image embeddings only. Filename search
+                  matches the indexed file name and full path in the library
+                  database (SQL). With both filled, semantic hits are narrowed
+                  by the filename filter.
                 </p>
                 <div className="mt-5 grid grid-cols-2 gap-4">
                   <label>
