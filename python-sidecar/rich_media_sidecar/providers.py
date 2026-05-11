@@ -23,6 +23,12 @@ from urllib import request, error
 
 from PIL import Image
 
+try:
+    from pillow_heif import register_heif_opener
+    register_heif_opener()
+except Exception:
+    pass
+
 os.environ.setdefault("ORT_LOG_SEVERITY_LEVEL", "3")
 warnings.filterwarnings("ignore", message="Cannot enable progress bars.*", category=UserWarning)
 

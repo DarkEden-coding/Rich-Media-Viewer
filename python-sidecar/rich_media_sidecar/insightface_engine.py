@@ -14,6 +14,12 @@ from typing import Any
 import numpy as np
 from PIL import Image, ImageOps
 
+try:
+    from pillow_heif import register_heif_opener
+    register_heif_opener()
+except Exception:
+    pass
+
 from .clustering import ClusterResponse, FaceResult, cosine
 
 try:

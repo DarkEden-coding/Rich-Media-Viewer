@@ -22,6 +22,7 @@ use tauri_plugin_dialog::DialogExt;
 use tauri_plugin_window_state::StateFlags;
 
 const DB_FILE: &str = "rich-media-viewer.sqlite3";
+const HEIC_CONVERSIONS_DIR: &str = "heic-conversions";
 /// Cosine threshold for InsightFace `buffalo_l` L2-normalized embeddings (inner product).
 const INSIGHTFACE_FACE_MATCH_THRESHOLD: f64 = 0.42;
 const FACE_EMBEDDING_MODEL: &str = "insightface-buffalo_l";
@@ -91,6 +92,7 @@ const BLACKLISTED_FOLDER_NAMES: &[&str] = &[
     "photo cache",
     "previews",
     "preview",
+    "heic-conversions",
     "derivatives",
     "renders",
     "proxies",
@@ -151,6 +153,7 @@ struct AppInfo {
 struct MediaItem {
     id: i64,
     path: String,
+    display_path: Option<String>,
     file_name: String,
     extension: Option<String>,
     media_type: String,
@@ -282,6 +285,9 @@ fn app_data_dir(_app: &tauri::AppHandle) -> Result<PathBuf, String> {
 fn db_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
     Ok(app_data_dir(app)?.join(DB_FILE))
 }
+fn heic_conversions_dir(app: &tauri::AppHandle) -> Result<PathBuf, String> {
+    Ok(app_data_dir(app)?.join(HEIC_CONVERSIONS_DIR))
+}
 fn open_db(app: &tauri::AppHandle) -> Result<Connection, String> {
     let dir = app_data_dir(app)?;
     fs::create_dir_all(&dir).map_err(|e| format!("failed to create app data dir: {e}"))?;
@@ -365,6 +371,16 @@ fn media_type_for_ext(ext: Option<&str>) -> Option<&'static str> {
         | "mts" | "m2ts" | "ts" => Some("video"),
         _ => None,
     }
+}
+fn is_heic_path(path: &str) -> bool {
+    matches!(
+        Path::new(path)
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|s| s.trim_start_matches('.').to_ascii_lowercase())
+            .as_deref(),
+        Some("heic" | "heif")
+    )
 }
 fn parse_exif(
     path: &Path,
@@ -464,6 +480,7 @@ fn media_from_path_with_existing(
     Ok(Some(MediaIndexResult::Upsert(MediaItem {
         id: 0,
         path: path_string,
+        display_path: None,
         file_name: path
             .file_name()
             .and_then(|n| n.to_str())
@@ -518,6 +535,7 @@ fn row_to_media(row: &rusqlite::Row<'_>) -> rusqlite::Result<MediaItem> {
     Ok(MediaItem {
         id: row.get(0)?,
         path: row.get(1)?,
+        display_path: None,
         file_name: row.get(2)?,
         extension: row.get(3)?,
         media_type: row.get(4)?,
@@ -534,6 +552,75 @@ fn row_to_media(row: &rusqlite::Row<'_>) -> rusqlite::Result<MediaItem> {
         longitude: row.get(15)?,
         metadata_json: row.get(16)?,
     })
+}
+
+fn converted_heic_paths(
+    app: &tauri::AppHandle,
+    paths: &[String],
+) -> Result<HashMap<String, String>, String> {
+    let heic_paths: Vec<String> = paths.iter().filter(|p| is_heic_path(p)).cloned().collect();
+    if heic_paths.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let cache_dir = heic_conversions_dir(app)?;
+    fs::create_dir_all(&cache_dir).map_err(|e| {
+        format!(
+            "failed to create HEIC conversion cache {}: {e}",
+            cache_dir.display()
+        )
+    })?;
+    let payload = serde_json::json!({"paths": heic_paths, "cache_dir": cache_dir});
+    let res = run_sidecar_json_payload(vec!["convert-heic".into()], &payload)?;
+    if !res.ok {
+        return Err(if res.stderr.trim().is_empty() {
+            "HEIC conversion failed".to_string()
+        } else {
+            res.stderr.trim().to_string()
+        });
+    }
+    let root: serde_json::Value = serde_json::from_str(&res.stdout)
+        .map_err(|e| format!("invalid HEIC conversion JSON: {e}"))?;
+    let mut out = HashMap::new();
+    if let Some(items) = root.pointer("/data/conversions").and_then(|v| v.as_array()) {
+        for item in items {
+            let Some(source) = item.get("source").and_then(|v| v.as_str()) else {
+                continue;
+            };
+            let Some(converted) = item.get("converted").and_then(|v| v.as_str()) else {
+                continue;
+            };
+            out.insert(clean_path_str(source), clean_path_str(converted));
+        }
+    }
+    Ok(out)
+}
+
+fn enrich_display_paths(app: &tauri::AppHandle, items: &mut [MediaItem]) -> Result<(), String> {
+    let paths: Vec<String> = items
+        .iter()
+        .filter(|item| !item.missing)
+        .map(|item| item.path.clone())
+        .collect();
+    let conversions = converted_heic_paths(app, &paths)?;
+    for item in items {
+        item.display_path = conversions.get(&item.path).cloned();
+    }
+    Ok(())
+}
+
+fn sidecar_media_rows(
+    app: &tauri::AppHandle,
+    rows: Vec<(i64, String)>,
+) -> Result<Vec<(i64, String)>, String> {
+    let paths: Vec<String> = rows.iter().map(|(_, path)| path.clone()).collect();
+    let conversions = converted_heic_paths(app, &paths)?;
+    Ok(rows
+        .into_iter()
+        .map(|(id, path)| {
+            let sidecar_path = conversions.get(&path).cloned().unwrap_or(path);
+            (id, sidecar_path)
+        })
+        .collect())
 }
 fn haversine_km(lat1: f64, lng1: f64, lat2: f64, lng2: f64) -> f64 {
     let earth_radius_km = 6371.0088_f64;
@@ -575,6 +662,15 @@ fn delete_current_index(app: tauri::AppHandle) -> Result<AppInfo, String> {
     if path.exists() {
         fs::remove_file(&path)
             .map_err(|e| format!("failed to delete database index {}: {e}", path.display()))?;
+    }
+    let conversions = heic_conversions_dir(&app)?;
+    if conversions.exists() {
+        fs::remove_dir_all(&conversions).map_err(|e| {
+            format!(
+                "failed to delete HEIC conversion cache {}: {e}",
+                conversions.display()
+            )
+        })?;
     }
     Ok(AppInfo {
         data_dir: app_data_dir(&app)?.to_string_lossy().to_string(),
@@ -1248,14 +1344,18 @@ async fn rescan(app: tauri::AppHandle) -> Result<ScanSummary, String> {
 }
 #[tauri::command]
 fn get_media_item(app: tauri::AppHandle, id: i64) -> Result<Option<MediaItem>, String> {
-    open_db(&app)?
+    let mut item = open_db(&app)?
         .query_row(
             &format!("{MEDIA_SELECT} WHERE id=?1"),
             params![id],
             row_to_media,
         )
         .optional()
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+    if let Some(item) = item.as_mut() {
+        enrich_display_paths(&app, std::slice::from_mut(item))?;
+    }
+    Ok(item)
 }
 #[tauri::command]
 fn search_media(app: tauri::AppHandle, filter: SearchFilter) -> Result<Vec<MediaItem>, String> {
@@ -1385,6 +1485,7 @@ fn search_media(app: tauri::AppHandle, filter: SearchFilter) -> Result<Vec<Media
             .take(limit)
             .collect();
     }
+    enrich_display_paths(&app, &mut res)?;
     Ok(res)
 }
 #[tauri::command]
@@ -1982,7 +2083,7 @@ fn process_face_paths(
     face_sidecar_pool_size: usize,
 ) -> Result<SidecarResult, String> {
     let mut conn = open_db(&app)?;
-    let rows = media_paths_for_ids(&conn, media_ids, true)?;
+    let rows = sidecar_media_rows(&app, media_paths_for_ids(&conn, media_ids, true)?)?;
     let paths: Vec<String> = rows.iter().map(|(_, p)| p.clone()).collect();
     let payload = serde_json::json!({"paths":paths}).to_string();
     let res = run_face_sidecar(&payload, face_sidecar_pool_size)?;
@@ -2085,7 +2186,10 @@ fn generate_embeddings_impl(
     let mut conn = open_db(&app)?;
     let selected_provider = provider.unwrap_or_else(|| "fastembed".into());
     let selected_model = model.unwrap_or_else(|| "Qdrant/clip-ViT-B-32".into());
-    let rows = media_paths_for_ids(&conn, media_ids, selected_provider == "fastembed")?;
+    let rows = sidecar_media_rows(
+        &app,
+        media_paths_for_ids(&conn, media_ids, selected_provider == "fastembed")?,
+    )?;
     let total = rows.len();
     let mut summary = ScanSummary::default();
     emit_scan_progress(
@@ -2406,7 +2510,7 @@ fn search_semantic_impl(
         let item = row.map_err(|e| e.to_string())?;
         media_by_id.insert(item.id, item);
     }
-    Ok(candidates
+    let mut hits: Vec<SemanticHit> = candidates
         .into_iter()
         .filter_map(|candidate| {
             media_by_id
@@ -2417,7 +2521,13 @@ fn search_semantic_impl(
                     item,
                 })
         })
-        .collect())
+        .collect();
+    let mut items: Vec<MediaItem> = hits.iter().map(|hit| hit.item.clone()).collect();
+    enrich_display_paths(&app, &mut items)?;
+    for (hit, item) in hits.iter_mut().zip(items.into_iter()) {
+        hit.item = item;
+    }
+    Ok(hits)
 }
 #[tauri::command]
 fn search_semantic(

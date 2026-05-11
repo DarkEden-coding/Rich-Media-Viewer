@@ -20,6 +20,7 @@ type AppInfo = {
 type MediaItem = {
   id: number;
   path: string;
+  display_path: string | null;
   file_name: string;
   extension: string | null;
   media_type: string;
@@ -365,7 +366,7 @@ function fileUrl(path: string) {
   }
 }
 function mediaUrl(item: MediaItem) {
-  return fileUrl(item.path);
+  return fileUrl(item.display_path || item.path);
 }
 function dateToEpoch(value: string, end = false) {
   if (!value) return undefined;

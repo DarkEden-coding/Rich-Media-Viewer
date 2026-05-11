@@ -22,6 +22,7 @@ const BLACKLISTED: &[&str] = &[
     "photo cache",
     "previews",
     "preview",
+    "heic-conversions",
     "derivatives",
     "renders",
     "proxies",

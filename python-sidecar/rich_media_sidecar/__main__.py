@@ -10,6 +10,7 @@ from typing import Any
 import numpy as np
 
 from .clustering import cosine
+from .heic import convert_heic_paths
 from .insightface_engine import cluster_paths as insightface_cluster_paths
 from .insightface_engine import handle_face_match_request
 from .providers import FASTEMBED_EMBEDDING_MODELS, GOOGLE_EMBEDDING_MODELS, OPENROUTER_EMBEDDING_MODELS, RemoteProviderUnavailableError, create_provider, embed_paths, embed_texts
@@ -68,6 +69,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Read one JSON object from stdin (avoids huge argv on Windows)",
     )
+
+    ch = sub.add_parser("convert-heic", help="Convert HEIC/HEIF files to cached JPEG files")
+    ch.add_argument("paths", nargs="*", type=Path)
+    ch.add_argument("--cache-dir", type=Path, default=None)
+    ch.add_argument("--json", dest="json_payload", help="JSON request: {paths:[], cache_dir:string}")
 
     m = sub.add_parser("embedding-models", help="List common embedding models by provider")
 
@@ -135,6 +141,15 @@ def main(argv: list[str] | None = None) -> int:
             paths = [Path(p) for p in payload.get("paths", [])] + list(args.paths)
             threshold = float(payload.get("threshold", args.threshold))
             write_ok(insightface_cluster_paths(paths, threshold))
+            return 0
+        if args.command == "convert-heic":
+            payload = _payload(args.json_payload)
+            paths = [Path(p) for p in payload.get("paths", [])] + list(args.paths)
+            cache_dir_value = payload.get("cache_dir", args.cache_dir)
+            if not cache_dir_value:
+                raise ValueError("convert-heic requires --cache-dir or cache_dir in --json")
+            conversions = convert_heic_paths(paths, Path(cache_dir_value))
+            write_ok({"conversions": conversions})
             return 0
         if args.command == "serve-faces":
             return serve_faces(float(args.threshold))
