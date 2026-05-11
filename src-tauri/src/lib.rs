@@ -2,8 +2,8 @@ use rayon::prelude::*;
 use rusqlite::{params, params_from_iter, Connection, OptionalExtension, ToSql};
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::{HashMap, HashSet, VecDeque},
     cmp::Ordering as CmpOrdering,
+    collections::{HashMap, HashSet, VecDeque},
     fs,
     io::{BufRead, BufReader, Write},
     path::{Path, PathBuf},
@@ -2155,9 +2155,6 @@ fn parse_vec(b: Vec<u8>) -> Option<Vec<f32>> {
             .and_then(|s| serde_json::from_str(s).ok())
     })
 }
-fn vector_norm(a: &[f32]) -> f32 {
-    a.iter().map(|x| x * x).sum::<f32>().sqrt()
-}
 fn cosine_with_norm(a: &[f32], a_norm: f32, b: &[f32]) -> f64 {
     let (mut dot, mut nb) = (0.0f32, 0.0f32);
     for (x, y) in a.iter().zip(b) {
@@ -2169,6 +2166,43 @@ fn cosine_with_norm(a: &[f32], a_norm: f32, b: &[f32]) -> f64 {
     } else {
         (dot / (a_norm * nb.sqrt())) as f64
     }
+}
+fn score_vec_compacting(
+    query: &[f32],
+    query_norm: f32,
+    b: &[u8],
+) -> Option<(f64, Option<Vec<u8>>)> {
+    if b.len() % std::mem::size_of::<f32>() == 0 && !b.starts_with(b"[") {
+        if b.len() / std::mem::size_of::<f32>() != query.len() {
+            return None;
+        }
+        let (mut dot, mut nb) = (0.0f32, 0.0f32);
+        for (x, chunk) in query.iter().zip(b.chunks_exact(std::mem::size_of::<f32>())) {
+            let y = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+            dot += *x * y;
+            nb += y * y;
+        }
+        let score = if query_norm == 0.0 || nb == 0.0 {
+            0.0
+        } else {
+            (dot / (query_norm * nb.sqrt())) as f64
+        };
+        return Some((score, None));
+    }
+    let vector: Vec<f32> = serde_json::from_slice(b).ok().or_else(|| {
+        std::str::from_utf8(b)
+            .ok()
+            .and_then(|s| serde_json::from_str(s).ok())
+    })?;
+    if vector.len() != query.len() {
+        return None;
+    }
+    let score = cosine_with_norm(query, query_norm, &vector);
+    let compacted = vec_to_blob(&vector);
+    Some((score, Some(compacted)))
+}
+fn vector_norm(a: &[f32]) -> f32 {
+    a.iter().map(|x| x * x).sum::<f32>().sqrt()
 }
 fn cosine(a: &[f32], b: &[f32]) -> f64 {
     cosine_with_norm(a, vector_norm(a), b)
@@ -2202,9 +2236,9 @@ fn search_semantic_impl(
     model: Option<String>,
     limit: Option<i64>,
 ) -> Result<Vec<SemanticHit>, String> {
-    let c = open_db(&app)?;
+    let mut c = open_db(&app)?;
     let mut semantic_sql = format!(
-        "SELECT e.media_item_id,e.vector FROM embeddings e JOIN media_items ON media_items.id=e.media_item_id WHERE e.media_item_id IS NOT NULL{}",
+        "SELECT e.id,e.media_item_id,e.vector FROM embeddings e JOIN media_items ON media_items.id=e.media_item_id WHERE e.media_item_id IS NOT NULL{}",
         sql_path_not_blacklisted_clause()
     );
     let mut params_vec: Vec<Box<dyn ToSql>> = vec![];
@@ -2214,19 +2248,26 @@ fn search_semantic_impl(
     }
     let max_hits = limit.unwrap_or(50).clamp(1, 200) as usize;
     let query_norm = vector_norm(&vector);
-    let refs: Vec<&dyn ToSql> = params_vec.iter().map(|x| x.as_ref()).collect();
-    let mut s = c.prepare(&semantic_sql).map_err(|e| e.to_string())?;
-    let rows = s
-        .query_map(params_from_iter(refs), |row| {
-            Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?))
-        })
-        .map_err(|e| e.to_string())?;
     let mut candidates: Vec<SemanticCandidate> = Vec::with_capacity(max_hits + 1);
-    for r in rows {
-        let (media_id, b) = r.map_err(|e| e.to_string())?;
-        if let Some(v) = parse_vec(b) {
-            if v.len() == vector.len() {
-                let score = cosine_with_norm(&vector, query_norm, &v);
+    let mut compacted_vectors: Vec<(i64, Vec<u8>)> = vec![];
+    {
+        let refs: Vec<&dyn ToSql> = params_vec.iter().map(|x| x.as_ref()).collect();
+        let mut s = c.prepare(&semantic_sql).map_err(|e| e.to_string())?;
+        let rows = s
+            .query_map(params_from_iter(refs), |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, Vec<u8>>(2)?,
+                ))
+            })
+            .map_err(|e| e.to_string())?;
+        for r in rows {
+            let (embedding_id, media_id, b) = r.map_err(|e| e.to_string())?;
+            if let Some((score, compacted)) = score_vec_compacting(&vector, query_norm, &b) {
+                if let Some(compacted) = compacted {
+                    compacted_vectors.push((embedding_id, compacted));
+                }
                 if candidates.len() < max_hits {
                     candidates.push(SemanticCandidate { score, media_id });
                     if candidates.len() == max_hits {
@@ -2246,6 +2287,19 @@ fn search_semantic_impl(
                 }
             }
         }
+    }
+    if !compacted_vectors.is_empty() {
+        let mut conn = c;
+        let tx = conn.transaction().map_err(|e| e.to_string())?;
+        for (embedding_id, compacted) in compacted_vectors {
+            tx.execute(
+                "UPDATE embeddings SET vector=?1 WHERE id=?2",
+                params![compacted, embedding_id],
+            )
+            .map_err(|e| e.to_string())?;
+        }
+        tx.commit().map_err(|e| e.to_string())?;
+        c = conn;
     }
     candidates.sort_by(|a, b| {
         b.score
@@ -2274,7 +2328,8 @@ fn search_semantic_impl(
         .into_iter()
         .filter_map(|candidate| {
             media_by_id
-                .remove(&candidate.media_id)
+                .get(&candidate.media_id)
+                .cloned()
                 .map(|item| SemanticHit {
                     score: candidate.score,
                     item,
@@ -2333,27 +2388,6 @@ fn search_semantic_text(
         .ok_or_else(|| "sidecar did not return a query embedding".to_string())?;
     let vector: Vec<f32> = serde_json::from_value(vecv.clone()).map_err(|e| e.to_string())?;
     search_semantic_impl(app, vector, Some(selected_model), limit)
-}
-fn row_to_media_offset(row: &rusqlite::Row<'_>, o: usize) -> rusqlite::Result<MediaItem> {
-    Ok(MediaItem {
-        id: row.get(o)?,
-        path: row.get(o + 1)?,
-        file_name: row.get(o + 2)?,
-        extension: row.get(o + 3)?,
-        media_type: row.get(o + 4)?,
-        size_bytes: row.get(o + 5)?,
-        created_at: row.get(o + 6)?,
-        modified_at: row.get(o + 7)?,
-        imported_at: row.get(o + 8)?,
-        missing: row.get::<_, i64>(o + 9)? != 0,
-        camera_make: row.get(o + 10)?,
-        camera_model: row.get(o + 11)?,
-        lens_model: row.get(o + 12)?,
-        captured_at: row.get(o + 13)?,
-        latitude: row.get(o + 14)?,
-        longitude: row.get(o + 15)?,
-        metadata_json: row.get(o + 16)?,
-    })
 }
 #[tauri::command]
 fn greet(name: &str) -> String {
