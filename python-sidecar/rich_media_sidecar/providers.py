@@ -8,6 +8,8 @@ import base64
 import json
 import mimetypes
 import os
+import threading
+import tempfile
 from io import BytesIO
 from dataclasses import dataclass
 from pathlib import Path
@@ -16,11 +18,8 @@ from urllib import request, error
 
 from PIL import Image
 
-OLLAMA_EMBEDDING_MODELS = [
-    "nomic-embed-text",
-    "mxbai-embed-large",
-    "snowflake-arctic-embed",
-    "all-minilm",
+FASTEMBED_EMBEDDING_MODELS = [
+    "Qdrant/clip-ViT-B-32",
 ]
 
 GOOGLE_EMBEDDING_MODELS = [
@@ -100,38 +99,194 @@ def _image_bytes_for_embedding(path: Path, mime: str, max_width: int | None) -> 
         return output_mime, base64.b64encode(output.getvalue()).decode("ascii")
 
 
-class OllamaEmbeddingProvider:
-    """Local Ollama embeddings provider.
+def _resize_image_to_temp_file(path: Path, mime: str, max_width: int) -> Path:
+    with Image.open(path) as img:
+        if img.width <= max_width:
+            return path
+        height = max(1, round(img.height * (max_width / img.width)))
+        resized = img.copy()
+        resized.thumbnail((max_width, height), Image.Resampling.LANCZOS)
+        suffix = {
+            "image/jpeg": ".jpg",
+            "image/png": ".png",
+            "image/webp": ".webp",
+        }.get(mime, ".jpg")
+        output_mime = mime if suffix != ".jpg" else "image/jpeg"
+        format_name = {"image/jpeg": "JPEG", "image/png": "PNG", "image/webp": "WEBP"}[output_mime]
+        if output_mime == "image/jpeg" and resized.mode not in ("RGB", "L"):
+            resized = resized.convert("RGB")
+        elif output_mime in {"image/png", "image/webp"} and resized.mode == "P":
+            resized = resized.convert("RGBA")
+        tmp = tempfile.NamedTemporaryFile(prefix="rmv-fastembed-", suffix=suffix, delete=False)
+        tmp_path = Path(tmp.name)
+        tmp.close()
+        save_kwargs = {"quality": 85, "optimize": True} if output_mime in {"image/jpeg", "image/webp"} else {"optimize": True}
+        resized.save(tmp_path, format=format_name, **save_kwargs)
+        return tmp_path
 
-    Ollama's embedding endpoint accepts text input. Media bytes are intentionally
-    not proxied through filename/metadata embeddings; unsupported media paths are
-    skipped so the app only embeds formats supported by the selected model/API.
-    """
 
-    name = "ollama"
+class FastEmbedEmbeddingProvider:
+    """Local FastEmbed CLIP provider for image embeddings and text queries."""
 
-    def __init__(self, model: str = "nomic-embed-text", base_url: str | None = None) -> None:
-        self.model = model.strip() or "nomic-embed-text"
-        self.base_url = (base_url or os.getenv("OLLAMA_HOST") or "http://localhost:11434").rstrip("/")
+    name = "fastembed"
 
-    def _post(self, payload: dict) -> dict:
-        data = json.dumps(payload).encode("utf-8")
-        req = request.Request(f"{self.base_url}/api/embed", data=data, headers={"Content-Type": "application/json"})
+    def __init__(
+        self,
+        model: str = "Qdrant/clip-ViT-B-32",
+        image_max_width: int | None = None,
+        batch_size: int | None = None,
+    ) -> None:
+        self.model = self._canonical_model(model)
+        self.image_model_name = f"{self.model}-vision"
+        self.text_model_name = f"{self.model}-text"
+        self.image_max_width = image_max_width
+        self.batch_size = max(1, batch_size or int(os.getenv("RMV_FASTEMBED_BATCH_SIZE", "16")))
+        self.parallel = max(1, int(os.getenv("RMV_FASTEMBED_PARALLEL", "1")))
+        self.threads = max(1, int(os.getenv("RMV_FASTEMBED_THREADS", str(os.cpu_count() or 4))))
+        self.device = (os.getenv("RMV_FASTEMBED_DEVICE") or "auto").strip().lower()
+        self.providers = self._execution_providers()
+        self._image_model = None
+        self._text_model = None
+        self._lock = threading.Lock()
+
+    @staticmethod
+    def _canonical_model(model: str | None) -> str:
+        name = (model or "Qdrant/clip-ViT-B-32").strip() or "Qdrant/clip-ViT-B-32"
+        if name.endswith("-vision"):
+            return name.removesuffix("-vision")
+        if name.endswith("-text"):
+            return name.removesuffix("-text")
+        return name
+
+    def _execution_providers(self) -> list[str]:
+        if self.device == "cpu":
+            return ["CPUExecutionProvider"]
+        cuda_providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
+        if self.device == "cuda":
+            return cuda_providers
         try:
-            with request.urlopen(req, timeout=60) as resp:
-                return json.loads(resp.read().decode("utf-8"))
-        except error.URLError as exc:
-            raise RemoteProviderUnavailableError(f"Ollama request failed. Is Ollama running and is model '{self.model}' pulled? {exc}") from exc
+            import onnxruntime as ort
+            if "CUDAExecutionProvider" in ort.get_available_providers():
+                return cuda_providers
+        except Exception:
+            pass
+        return ["CPUExecutionProvider"]
+
+    def _get_image_model(self):
+        if self._image_model is None:
+            try:
+                from fastembed import ImageEmbedding
+            except ImportError as exc:
+                raise RemoteProviderUnavailableError("FastEmbed is not installed. Install python-sidecar dependencies before using local FastEmbed embeddings.") from exc
+            self._image_model = ImageEmbedding(
+                self.image_model_name,
+                threads=self.threads,
+                providers=self.providers,
+            )
+        return self._image_model
+
+    def _get_text_model(self):
+        if self._text_model is None:
+            try:
+                from fastembed import TextEmbedding
+            except ImportError as exc:
+                raise RemoteProviderUnavailableError("FastEmbed is not installed. Install python-sidecar dependencies before using local FastEmbed embeddings.") from exc
+            self._text_model = TextEmbedding(
+                self.text_model_name,
+                threads=self.threads,
+                providers=self.providers,
+            )
+        return self._text_model
 
     def embed_path(self, path: Path) -> EmbeddingResult:
-        return EmbeddingResult(str(path), self.name, [], kind="unsupported", model=self.model, error="Ollama embedding models accept text input only; media files are not proxied into embeddings.")
+        mime = _guess_mime(path)
+        if not mime or not mime.startswith("image/"):
+            return _unsupported(path, self.name, self.model, f"FastEmbed local CLIP embeddings support images only; unsupported MIME type: {mime or 'unknown'}.")
+        try:
+            embed_path = path
+            cleanup_path: Path | None = None
+            if self.image_max_width and self.image_max_width > 0:
+                embed_path = _resize_image_to_temp_file(path, mime, self.image_max_width)
+                if embed_path != path:
+                    cleanup_path = embed_path
+            with self._lock:
+                vector = list(self._get_image_model().embed([str(embed_path)]))[0]
+            return EmbeddingResult(str(path), self.name, [float(x) for x in vector], kind="image", model=self.model)
+        except OSError as exc:
+            return _unsupported(path, self.name, self.model, f"Failed to read image file: {exc}")
+        except Exception as exc:
+            return _unsupported(path, self.name, self.model, f"FastEmbed image embedding failed: {exc}")
+        finally:
+            if "cleanup_path" in locals() and cleanup_path:
+                try:
+                    cleanup_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
 
     def embed_text(self, text: str, source: str | None = None) -> EmbeddingResult:
-        root = self._post({"model": self.model, "input": text})
-        embeddings = root.get("embeddings") or []
-        if not embeddings:
-            raise RemoteProviderUnavailableError(f"Ollama model '{self.model}' did not return an embedding.")
-        return EmbeddingResult(source or text[:80], self.name, [float(x) for x in embeddings[0]], kind="text", model=self.model)
+        try:
+            with self._lock:
+                vector = list(self._get_text_model().embed([text]))[0]
+            return EmbeddingResult(source or text[:80], self.name, [float(x) for x in vector], kind="text", model=self.model)
+        except Exception as exc:
+            raise RemoteProviderUnavailableError(f"FastEmbed text embedding failed: {exc}") from exc
+
+    def embed_paths(self, paths: Iterable[Path], max_workers: int = 1) -> list[EmbeddingResult]:
+        items = list(paths)
+        supported: list[tuple[Path, Path]] = []
+        cleanup: list[Path] = []
+        results: list[EmbeddingResult] = []
+        for path in items:
+            mime = _guess_mime(path)
+            if not mime or not mime.startswith("image/"):
+                results.append(_unsupported(path, self.name, self.model, f"FastEmbed local CLIP embeddings support images only; unsupported MIME type: {mime or 'unknown'}."))
+                continue
+            try:
+                embed_path = path
+                if self.image_max_width and self.image_max_width > 0:
+                    embed_path = _resize_image_to_temp_file(path, mime, self.image_max_width)
+                    if embed_path != path:
+                        cleanup.append(embed_path)
+                supported.append((path, embed_path))
+            except OSError as exc:
+                results.append(_unsupported(path, self.name, self.model, f"Failed to read image file: {exc}"))
+            except Exception as exc:
+                results.append(_unsupported(path, self.name, self.model, f"Failed to prepare image file: {exc}"))
+        if supported:
+            results.extend(self._embed_supported_batch(supported, max_workers))
+        for path in cleanup:
+            try:
+                path.unlink(missing_ok=True)
+            except OSError:
+                pass
+        return results
+
+    def _embed_supported_batch(self, supported: list[tuple[Path, Path]], max_workers: int) -> list[EmbeddingResult]:
+        try:
+            embed_inputs = [str(embed_path) for _, embed_path in supported]
+            with self._lock:
+                vectors = list(
+                    self._get_image_model().embed(
+                        embed_inputs,
+                        batch_size=self.batch_size,
+                        parallel=max_workers if max_workers > 1 else self.parallel,
+                    )
+                )
+            return [
+                EmbeddingResult(str(source_path), self.name, [float(x) for x in vector], kind="image", model=self.model)
+                for (source_path, _), vector in zip(supported, vectors)
+            ]
+        except Exception:
+            if len(supported) <= 1:
+                source_path, embed_path = supported[0]
+                try:
+                    with self._lock:
+                        vector = list(self._get_image_model().embed([str(embed_path)], batch_size=1, parallel=None))[0]
+                    return [EmbeddingResult(str(source_path), self.name, [float(x) for x in vector], kind="image", model=self.model)]
+                except Exception as exc:
+                    return [_unsupported(source_path, self.name, self.model, f"FastEmbed image embedding failed: {exc}")]
+            midpoint = len(supported) // 2
+            return self._embed_supported_batch(supported[:midpoint], max_workers) + self._embed_supported_batch(supported[midpoint:], max_workers)
 
 
 class GoogleEmbeddingProvider:
@@ -259,19 +414,27 @@ class OpenRouterEmbeddingProvider:
         return self._embedding_from_input(text, source or text[:80], "text")
 
 
-def create_provider(name: str, model: str | None = None, image_max_width: int | None = None) -> EmbeddingProvider:
+def create_provider(
+    name: str,
+    model: str | None = None,
+    image_max_width: int | None = None,
+    batch_size: int | None = None,
+) -> EmbeddingProvider:
     n = name.strip().lower()
+    if n == "fastembed":
+        return FastEmbedEmbeddingProvider(model or "Qdrant/clip-ViT-B-32", image_max_width, batch_size)
     if n == "google":
         return GoogleEmbeddingProvider(model, image_max_width)
     if n == "openrouter":
         return OpenRouterEmbeddingProvider(model or OPENROUTER_DEFAULT_MODEL, image_max_width)
-    if n == "ollama":
-        return OllamaEmbeddingProvider(model or "nomic-embed-text")
     raise ValueError(f"Unknown embedding provider: {name}")
 
 
 def embed_paths(paths: Iterable[Path], provider: EmbeddingProvider, max_workers: int = 1) -> list[EmbeddingResult]:
     items = list(paths)
+    provider_batch_embed = getattr(provider, "embed_paths", None)
+    if callable(provider_batch_embed):
+        return provider_batch_embed(items, max_workers)
     if max_workers <= 1 or len(items) <= 1:
         return [provider.embed_path(p) for p in items]
     with ThreadPoolExecutor(max_workers=max_workers) as pool:

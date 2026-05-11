@@ -286,12 +286,9 @@ const icons = {
     </svg>
   ),
 };
-const providers = ["ollama", "google", "openrouter"];
-const ollamaEmbeddingModels = [
-  "nomic-embed-text",
-  "mxbai-embed-large",
-  "snowflake-arctic-embed",
-  "all-minilm",
+const providers = ["fastembed", "google", "openrouter"];
+const fastEmbedEmbeddingModels = [
+  "Qdrant/clip-ViT-B-32",
 ];
 const googleEmbeddingModels = [
   "gemini-embedding-2",
@@ -304,7 +301,7 @@ const openRouterEmbeddingModels = [
   "openai/text-embedding-3-large",
 ];
 const embeddingModelsByProvider: Record<string, string[]> = {
-  ollama: ollamaEmbeddingModels,
+  fastembed: fastEmbedEmbeddingModels,
   google: googleEmbeddingModels,
   openrouter: openRouterEmbeddingModels,
 };
@@ -566,11 +563,16 @@ function App() {
   const [provider, setProvider] = useState(
     providers.includes(localStorage.getItem("rmv.provider") || "")
       ? localStorage.getItem("rmv.provider")!
-      : "ollama",
+      : "fastembed",
   );
   const [embeddingModel, setEmbeddingModel] = useState(
-    localStorage.getItem("rmv.embeddingModel") ||
-      (embeddingModelsByProvider[provider]?.[0] ?? "nomic-embed-text"),
+    (() => {
+      const stored = localStorage.getItem("rmv.embeddingModel") || "";
+      const models = embeddingModelsByProvider[provider] ?? [];
+      return models.includes(stored)
+        ? stored
+        : (models[0] ?? "Qdrant/clip-ViT-B-32");
+    })(),
   );
   const [embeddingImageMaxWidth, setEmbeddingImageMaxWidth] = useState(
     localStorage.getItem("rmv.embeddingImageMaxWidth") || "1024",
@@ -992,6 +994,20 @@ function App() {
   }
   async function sidecar(cmd: "generate_embeddings") {
     setLoading(true);
+    setScanProgress({
+      phase: "Generating embeddings",
+      current_path: null,
+      scanned_files: 0,
+      imported_or_updated: 0,
+      skipped_files: 0,
+      missing_marked: 0,
+      errors: 0,
+      discovered_files: 0,
+      total_files: null,
+      faces_done: 0,
+      faces_total: null,
+      done: false,
+    });
     const imageMaxWidth = num(embeddingImageMaxWidth);
     try {
       const res = await invoke<SidecarResult>(cmd, {
@@ -999,20 +1015,31 @@ function App() {
         provider,
         model: embeddingModel,
         imageMaxWidth:
-          (provider === "google" || provider === "openrouter") &&
+          (provider === "fastembed" ||
+            provider === "google" ||
+            provider === "openrouter") &&
           imageMaxWidth &&
           imageMaxWidth > 0
             ? Math.floor(imageMaxWidth)
             : null,
       });
-      setNotice(
-        `${cmd}: ${res.ok ? "complete" : "failed"} ${res.stderr || res.stdout}`,
-      );
+      let detail = "";
+      try {
+        const parsed = JSON.parse(res.stdout);
+        const data = parsed.data;
+        if (data && typeof data.embedded === "number") {
+          detail = `: ${data.embedded} embedded, ${data.skipped ?? 0} skipped`;
+        }
+      } catch {
+        detail = res.stderr ? `: ${res.stderr}` : "";
+      }
+      setNotice(`${cmd}: ${res.ok ? "complete" : "failed"}${detail}`);
       await loadPeople();
     } catch (e) {
       setNotice(`${cmd} failed: ${String(e)}`);
     } finally {
       setLoading(false);
+      setScanProgress(null);
     }
   }
   async function openFaceSetup() {
@@ -1673,10 +1700,11 @@ function App() {
                           ))}
                         </select>
                         <p className="mt-2 text-xs text-slate-500">
-                          Ollama is text-only here. Google Gemini Embedding 2
-                          can embed supported images, video, audio, and PDFs.
-                          OpenRouter supports multimodal embedding models such
-                          as Gemini Embedding 2 Preview for text and images.
+                          FastEmbed runs local CLIP image embeddings for text
+                          search. Google Gemini Embedding 2 can embed supported
+                          images, video, audio, and PDFs. OpenRouter supports
+                          multimodal embedding models such as Gemini Embedding 2
+                          Preview for text and images.
                         </p>
                       </div>
 
@@ -1702,11 +1730,11 @@ function App() {
                             ? "Set GOOGLE_API_KEY or GEMINI_API_KEY. Text-only Google models skip media files."
                             : provider === "openrouter"
                               ? "Set OPENROUTER_API_KEY. Models without image support skip media files."
-                              : "Pull the selected model in Ollama first. Media files are skipped because Ollama embeddings accept text input."}
+                              : "Downloads the selected FastEmbed CLIP model on first use. Non-image media files are skipped."}
                         </p>
                       </div>
 
-                      {(provider === "google" || provider === "openrouter") && (
+                      {(provider === "fastembed" || provider === "google" || provider === "openrouter") && (
                         <div>
                           <label className="text-sm font-medium text-slate-300 mb-2 block">
                             Image Downscale Max Width
@@ -1723,8 +1751,8 @@ function App() {
                             placeholder="Original size"
                           />
                           <p className="mt-2 text-xs text-slate-500">
-                            Images wider than this are resized before remote
-                            embedding. Leave empty to send original dimensions.
+                            Images wider than this are resized before
+                            embedding. Leave empty to use original dimensions.
                           </p>
                         </div>
                       )}

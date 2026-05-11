@@ -12,7 +12,7 @@ import numpy as np
 from .clustering import cosine
 from .insightface_engine import cluster_paths as insightface_cluster_paths
 from .insightface_engine import handle_face_match_request
-from .providers import GOOGLE_EMBEDDING_MODELS, OLLAMA_EMBEDDING_MODELS, OPENROUTER_EMBEDDING_MODELS, RemoteProviderUnavailableError, create_provider, embed_paths, embed_texts
+from .providers import FASTEMBED_EMBEDDING_MODELS, GOOGLE_EMBEDDING_MODELS, OPENROUTER_EMBEDDING_MODELS, RemoteProviderUnavailableError, create_provider, embed_paths, embed_texts
 
 
 def _jsonable(v: Any) -> Any:
@@ -35,8 +35,8 @@ def build_parser() -> argparse.ArgumentParser:
     sub = p.add_subparsers(dest="command", required=True)
 
     def provider_args(c: argparse.ArgumentParser) -> None:
-        c.add_argument("--provider", choices=("ollama", "google", "openrouter"), default="ollama", help="Embedding provider.")
-        c.add_argument("--model", default="nomic-embed-text", help="Embedding model to use")
+        c.add_argument("--provider", choices=("fastembed", "google", "openrouter"), default="fastembed", help="Embedding provider.")
+        c.add_argument("--model", default="Qdrant/clip-ViT-B-32", help="Embedding model to use")
 
     e = sub.add_parser("embed", help="Embed paths and/or text; emits JSON")
     provider_args(e)
@@ -44,6 +44,7 @@ def build_parser() -> argparse.ArgumentParser:
     e.add_argument("--text", action="append", default=[], help="Text to embed; may be repeated")
     e.add_argument("--json", dest="json_payload", help="JSON request: {paths:[], texts:[]}")
     e.add_argument("--workers", type=int, default=max(1, min(4, (os.cpu_count() or 2) // 2)), help="Embedding worker threads; kept low because embedding is computationally expensive")
+    e.add_argument("--batch-size", type=int, default=None, help="Provider batch size for local embedding models")
     e.add_argument("--image-max-width", type=int, default=None, help="Optional max image pixel width before remote embedding")
 
     cf = sub.add_parser("cluster-faces", help="Detect faces in images and cluster them")
@@ -123,7 +124,9 @@ def main(argv: list[str] | None = None) -> int:
             texts = list(payload.get("texts", [])) + list(args.text)
             image_max_width = payload.get("image_max_width", args.image_max_width)
             image_max_width = int(image_max_width) if image_max_width else None
-            provider = create_provider(args.provider, args.model, image_max_width)
+            batch_size = payload.get("batch_size", args.batch_size)
+            batch_size = int(batch_size) if batch_size else None
+            provider = create_provider(args.provider, args.model, image_max_width, batch_size)
             workers = max(1, args.workers)
             write_ok({"provider": provider.name, "workers": workers, "embeddings": embed_paths(paths, provider, workers) + embed_texts(texts, provider, workers)})
             return 0
@@ -143,7 +146,7 @@ def main(argv: list[str] | None = None) -> int:
             write_ok(handle_face_match_request(req))
             return 0
         if args.command == "embedding-models":
-            write_ok({"models": {"ollama": OLLAMA_EMBEDDING_MODELS, "google": GOOGLE_EMBEDDING_MODELS, "openrouter": OPENROUTER_EMBEDDING_MODELS}})
+            write_ok({"models": {"fastembed": FASTEMBED_EMBEDDING_MODELS, "google": GOOGLE_EMBEDDING_MODELS, "openrouter": OPENROUTER_EMBEDDING_MODELS}})
             return 0
         if args.command == "semantic-search":
             q = create_provider(args.provider, args.model).embed_text(args.query).embedding

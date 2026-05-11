@@ -6,78 +6,85 @@ Author: Rich Media Viewer contributors
 License: UNLICENSED
 Requires-Python: >=3.10
 Description-Content-Type: text/markdown
+Requires-Dist: numpy>=1.24
+Requires-Dist: Pillow>=10.0
+Requires-Dist: opencv-python-headless>=4.8
+Requires-Dist: insightface>=0.7.3
+Requires-Dist: onnxruntime-gpu[cuda,cudnn]>=1.21.0; platform_system == "Windows" or platform_system == "Linux"
+Requires-Dist: onnxruntime>=1.21.0; platform_system != "Windows" and platform_system != "Linux"
+Requires-Dist: faiss-cpu>=1.7.4
+Requires-Dist: fastembed>=0.7.0
 
 # Rich Media Viewer Python Sidecar
 
 JSON CLI for media intelligence. In development it is invoked by the Tauri/Rust backend for face clustering, embedding generation, and semantic text search.
 
-## Current status
+## Features
 
-The implementation includes:
-
-- Local OpenCV face detection and deterministic face clustering.
-- Ollama local text embeddings through `/api/embed`.
-- Google Gemini embeddings through `models.embedContent`.
-- OpenRouter embeddings through its OpenAI-compatible `/embeddings` endpoint.
-- Google `gemini-embedding-2` support for supported image, video, audio, and PDF bytes.
-- OpenRouter `google/gemini-embedding-2-preview` support for image bytes through OpenRouter's multimodal embedding input format.
-- Capability-aware skipping for media files unsupported by the selected embedding model.
-
-## Privacy and consent model
-
-Media libraries can contain sensitive biometric data. Future production use should follow these rules:
-
-1. Keep face detection, face crops, and face embeddings local.
-2. Clearly display which embedding provider is used and what data leaves the device.
-3. Clearly display which provider is used and what data leaves the device.
-4. Avoid storing raw face crops unless the user enables that behavior.
-5. Treat face embeddings as sensitive biometric-derived data.
-
-Google and OpenRouter embedding providers send selected query text and supported media inputs to remote APIs when configured.
+- Robust JSON responses: success is `{"ok":true,"data":...}`; errors are `{"ok":false,"error":{"code", "message"}}` on stderr.
+- Embedding providers:
+  - FastEmbed local CLIP image embeddings with text query embeddings
+  - Google Gemini embeddings through `models.embedContent`
+  - OpenRouter embeddings through its OpenAI-compatible `/embeddings` endpoint
+- Local face detection and clustering:
+  - OpenCV Haar cascade face boxes when `opencv-python-headless` is available
+  - deterministic face embeddings from cropped pixels
+  - simple DBSCAN-like online cosine clustering
+- Capability-aware media embedding:
+  - FastEmbed `Qdrant/clip-ViT-B-32` embeds local images and text queries in a shared CLIP vector space
+  - Google `gemini-embedding-2` sends supported image, video, audio, and PDF bytes to Gemini
+  - OpenRouter `google/gemini-embedding-2-preview` sends supported image bytes through OpenRouter's multimodal embedding input format
+  - Text-only models and unsupported media files are skipped instead of inventing proxy vectors
 
 ## Install
 
-From this directory:
-
 ```bash
+cd python-sidecar
 python -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-Install `numpy`, `Pillow`, and `opencv-python-headless` for face-recognition functionality.
+## CLI
 
-## CLI usage
-
-Show help:
+Embed paths and/or text:
 
 ```bash
-python -m rich_media_sidecar --help
+python -m rich_media_sidecar embed --provider google --model gemini-embedding-2 /path/a.jpg /path/video.mp4 --text "beach sunset"
 ```
 
-Generate Google multimodal embeddings for files:
+Resize large images before remote embedding:
 
 ```bash
-python -m rich_media_sidecar embed --provider google --model gemini-embedding-2 /path/to/image1.jpg /path/to/video.mp4
+python -m rich_media_sidecar embed --provider openrouter --model google/gemini-embedding-2-preview --image-max-width 1024 /path/a.jpg
 ```
 
-Run face clustering:
+JSON request form:
 
 ```bash
-python -m rich_media_sidecar cluster /path/to/image1.jpg /path/to/image2.jpg
+python -m rich_media_sidecar embed --provider fastembed --model Qdrant/clip-ViT-B-32 --json '{"paths":["/path/a.jpg"],"texts":["cat"]}'
 ```
 
-Generate OpenRouter text embeddings:
+Cluster faces:
 
 ```bash
-python -m rich_media_sidecar embed --provider openrouter --model google/gemini-embedding-2-preview /path/to/image.jpg --text "hello"
+python -m rich_media_sidecar cluster-faces /path/a.jpg /path/b.jpg --threshold 0.88
 ```
 
-## Future Tauri integration
+Output face records include `path`, `bbox` (`[x,y,width,height]`), `cluster_id`, and `embedding`.
 
-A future Rust backend can launch this sidecar as a subprocess and communicate using JSON over stdin/stdout or command arguments. Recommended next steps:
+Semantic search over prior embeddings:
 
-- Define a stable JSON-RPC-like protocol for requests and responses.
-- Package the sidecar with the Tauri app bundle.
-- Add secure user settings for provider choice and consent.
-- Add integration tests that exercise CLI behavior without requiring cloud credentials.
+```bash
+python -m rich_media_sidecar semantic-search --query "red car" --vectors embeddings.json
+```
+
+OpenRouter text embeddings:
+
+```bash
+OPENROUTER_API_KEY=... python -m rich_media_sidecar embed --provider openrouter --model google/gemini-embedding-2-preview /path/a.jpg --text "hello"
+```
+
+## Privacy
+
+Face embeddings are biometric-derived data and remain local. Google and OpenRouter embedding providers send selected query text and supported media inputs to their APIs when configured.

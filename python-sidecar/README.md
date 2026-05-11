@@ -6,7 +6,7 @@ JSON CLI for media intelligence. In development it is invoked by the Tauri/Rust 
 
 - Robust JSON responses: success is `{"ok":true,"data":...}`; errors are `{"ok":false,"error":{"code", "message"}}` on stderr.
 - Embedding providers:
-  - Ollama local text embeddings through `/api/embed`
+  - FastEmbed local CLIP image embeddings with text query embeddings
   - Google Gemini embeddings through `models.embedContent`
   - OpenRouter embeddings through its OpenAI-compatible `/embeddings` endpoint
 - Local face detection and clustering:
@@ -14,6 +14,7 @@ JSON CLI for media intelligence. In development it is invoked by the Tauri/Rust 
   - deterministic face embeddings from cropped pixels
   - simple DBSCAN-like online cosine clustering
 - Capability-aware media embedding:
+  - FastEmbed `Qdrant/clip-ViT-B-32` embeds local images and text queries in a shared CLIP vector space
   - Google `gemini-embedding-2` sends supported image, video, audio, and PDF bytes to Gemini
   - OpenRouter `google/gemini-embedding-2-preview` sends supported image bytes through OpenRouter's multimodal embedding input format
   - Text-only models and unsupported media files are skipped instead of inventing proxy vectors
@@ -44,7 +45,7 @@ python -m rich_media_sidecar embed --provider openrouter --model google/gemini-e
 JSON request form:
 
 ```bash
-python -m rich_media_sidecar embed --provider ollama --model nomic-embed-text --json '{"texts":["cat"]}'
+python -m rich_media_sidecar embed --provider fastembed --model Qdrant/clip-ViT-B-32 --json '{"paths":["/path/a.jpg"],"texts":["cat"]}'
 ```
 
 Cluster faces:

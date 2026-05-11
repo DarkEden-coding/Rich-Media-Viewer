@@ -2,7 +2,7 @@ use rayon::prelude::*;
 use rusqlite::{params, params_from_iter, Connection, OptionalExtension, ToSql};
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::{HashSet, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     fs,
     io::{BufRead, BufReader, Write},
     path::{Path, PathBuf},
@@ -26,7 +26,8 @@ const INSIGHTFACE_FACE_MATCH_THRESHOLD: f64 = 0.42;
 const FACE_EMBEDDING_MODEL: &str = "insightface-buffalo_l";
 const DISCOVERY_THREAD_MULTIPLIER: usize = 4;
 const INDEXING_THREAD_DIVISOR: usize = 2;
-static FACE_SIDECAR: OnceLock<Mutex<Option<FaceSidecarProcess>>> = OnceLock::new();
+const EMBEDDING_BATCH_SIZE: usize = 256;
+static FACE_SIDECARS: OnceLock<Mutex<Vec<FaceSidecarSlot>>> = OnceLock::new();
 
 fn backend_log(message: &str) {
     eprintln!("[rich-media-viewer backend] {message}");
@@ -49,6 +50,28 @@ fn indexing_thread_count() -> usize {
         .and_then(|v| v.parse().ok())
         .unwrap_or_else(|| (available_threads() / INDEXING_THREAD_DIVISOR).max(1))
         .clamp(1, 4)
+}
+fn embedding_thread_count(provider: &str) -> usize {
+    if provider.eq_ignore_ascii_case("fastembed") {
+        std::env::var("RMV_EMBEDDING_THREADS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(16usize)
+            .clamp(1, 16)
+    } else {
+        indexing_thread_count()
+    }
+}
+fn embedding_batch_size(provider: &str) -> usize {
+    if provider.eq_ignore_ascii_case("fastembed") {
+        std::env::var("RMV_FASTEMBED_BATCH_SIZE")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(16usize)
+            .clamp(1, 256)
+    } else {
+        16
+    }
 }
 fn face_indexing_thread_count() -> usize {
     std::env::var("RMV_FACE_THREADS")
@@ -160,7 +183,7 @@ struct SearchFilter {
     limit: Option<i64>,
     offset: Option<i64>,
 }
-#[derive(Debug, Serialize, Clone)]
+#[derive(Debug, Serialize, Clone, Default)]
 struct ScanSummary {
     scanned_files: usize,
     imported_or_updated: usize,
@@ -219,6 +242,10 @@ struct FaceSidecarProcess {
     child: Child,
     stdin: ChildStdin,
     stdout: BufReader<ChildStdout>,
+}
+struct FaceSidecarSlot {
+    process: Option<FaceSidecarProcess>,
+    in_use: bool,
 }
 #[derive(Debug, Serialize)]
 struct SemanticHit {
@@ -770,7 +797,13 @@ fn run_face_embedding_index_phase(
     let app_c = app.clone();
     pool.install(|| {
         batches.par_iter().for_each(|chunk| {
-            match process_face_paths(app_c.clone(), Some(chunk.clone()), false, true) {
+            match process_face_paths(
+                app_c.clone(),
+                Some(chunk.clone()),
+                false,
+                true,
+                face_threads,
+            ) {
                 Ok(r) if r.ok => {
                     let now = done.fetch_add(chunk.len(), Ordering::Relaxed) + chunk.len();
                     emit_scan_progress(
@@ -1577,6 +1610,25 @@ fn run_sidecar(args: Vec<String>) -> Result<SidecarResult, String> {
     })
 }
 
+fn run_sidecar_json_payload(
+    mut args: Vec<String>,
+    payload: &serde_json::Value,
+) -> Result<SidecarResult, String> {
+    let mut path = std::env::temp_dir();
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or_default();
+    path.push(format!("rich-media-viewer-sidecar-{unique}.json"));
+    fs::write(&path, payload.to_string())
+        .map_err(|e| format!("failed to write sidecar payload {}: {e}", path.display()))?;
+    args.push("--json".into());
+    args.push(format!("@{}", path.display()));
+    let res = run_sidecar(args);
+    let _ = fs::remove_file(&path);
+    res
+}
+
 fn spawn_face_sidecar(dir: &Path) -> Result<FaceSidecarProcess, String> {
     backend_log("starting persistent python face sidecar");
     let mut child = sidecar_command(dir)
@@ -1604,42 +1656,122 @@ fn spawn_face_sidecar(dir: &Path) -> Result<FaceSidecarProcess, String> {
         stdout: BufReader::new(stdout),
     })
 }
-fn run_face_sidecar(payload: &str) -> Result<SidecarResult, String> {
-    let dir = sidecar_dir()?;
-    let mutex = FACE_SIDECAR.get_or_init(|| Mutex::new(None));
-    let mut guard = mutex
-        .lock()
-        .map_err(|_| "face sidecar mutex poisoned".to_string())?;
-    let needs_spawn = guard
-        .as_mut()
-        .and_then(|process| process.child.try_wait().ok().flatten())
-        .is_some()
-        || guard.is_none();
-    if needs_spawn {
-        *guard = Some(spawn_face_sidecar(&dir)?);
+fn take_face_sidecar(dir: &Path, pool_size: usize) -> Result<(usize, FaceSidecarProcess), String> {
+    let pool_size = pool_size.max(1);
+    let pool = FACE_SIDECARS.get_or_init(|| Mutex::new(Vec::new()));
+    loop {
+        let mut guard = pool
+            .lock()
+            .map_err(|_| "face sidecar pool mutex poisoned".to_string())?;
+        for (idx, slot) in guard.iter_mut().enumerate() {
+            if !slot.in_use {
+                slot.in_use = true;
+                let mut process = match slot.process.take() {
+                    Some(process) => process,
+                    None => {
+                        drop(guard);
+                        return match spawn_face_sidecar(dir) {
+                            Ok(process) => Ok((idx, process)),
+                            Err(e) => {
+                                release_face_sidecar_slot(idx)?;
+                                Err(e)
+                            }
+                        };
+                    }
+                };
+                let exited = match process.child.try_wait() {
+                    Ok(status) => status.is_some(),
+                    Err(e) => {
+                        drop(guard);
+                        release_face_sidecar_slot(idx)?;
+                        return Err(format!("failed to check face sidecar status: {e}"));
+                    }
+                };
+                if exited {
+                    drop(guard);
+                    return match spawn_face_sidecar(dir) {
+                        Ok(process) => Ok((idx, process)),
+                        Err(e) => {
+                            release_face_sidecar_slot(idx)?;
+                            Err(e)
+                        }
+                    };
+                }
+                return Ok((idx, process));
+            }
+        }
+        if guard.len() < pool_size {
+            let idx = guard.len();
+            guard.push(FaceSidecarSlot {
+                process: None,
+                in_use: true,
+            });
+            drop(guard);
+            return match spawn_face_sidecar(dir) {
+                Ok(process) => Ok((idx, process)),
+                Err(e) => {
+                    release_face_sidecar_slot(idx)?;
+                    Err(e)
+                }
+            };
+        }
+        drop(guard);
+        thread::sleep(Duration::from_millis(10));
     }
-    let process = guard
-        .as_mut()
-        .ok_or_else(|| "face sidecar unavailable".to_string())?;
+}
+
+fn return_face_sidecar(idx: usize, process: FaceSidecarProcess) -> Result<(), String> {
+    let pool = FACE_SIDECARS.get_or_init(|| Mutex::new(Vec::new()));
+    let mut guard = pool
+        .lock()
+        .map_err(|_| "face sidecar pool mutex poisoned".to_string())?;
+    if idx >= guard.len() {
+        guard.resize_with(idx + 1, || FaceSidecarSlot {
+            process: None,
+            in_use: false,
+        });
+    }
+    guard[idx].process = Some(process);
+    guard[idx].in_use = false;
+    Ok(())
+}
+
+fn release_face_sidecar_slot(idx: usize) -> Result<(), String> {
+    let pool = FACE_SIDECARS.get_or_init(|| Mutex::new(Vec::new()));
+    let mut guard = pool
+        .lock()
+        .map_err(|_| "face sidecar pool mutex poisoned".to_string())?;
+    if let Some(slot) = guard.get_mut(idx) {
+        slot.process = None;
+        slot.in_use = false;
+    }
+    Ok(())
+}
+
+fn run_face_sidecar(payload: &str, pool_size: usize) -> Result<SidecarResult, String> {
+    let dir = sidecar_dir()?;
+    let (idx, mut process) = take_face_sidecar(&dir, pool_size)?;
     if let Err(exc) = writeln!(process.stdin, "{payload}").and_then(|_| process.stdin.flush()) {
         backend_log(&format!(
             "restarting face sidecar after write failure: {exc}"
         ));
-        *process = spawn_face_sidecar(&dir)?;
-        writeln!(process.stdin, "{payload}")
-            .and_then(|_| process.stdin.flush())
-            .map_err(|e| format!("failed to write face sidecar stdin: {e}"))?;
+        process = spawn_face_sidecar(&dir)?;
+        if let Err(e) = writeln!(process.stdin, "{payload}").and_then(|_| process.stdin.flush()) {
+            release_face_sidecar_slot(idx)?;
+            return Err(format!("failed to write face sidecar stdin: {e}"));
+        }
     }
     let mut stdout = String::new();
-    process
-        .stdout
-        .read_line(&mut stdout)
-        .map_err(|e| format!("failed to read face sidecar stdout: {e}"))?;
+    if let Err(e) = process.stdout.read_line(&mut stdout) {
+        release_face_sidecar_slot(idx)?;
+        return Err(format!("failed to read face sidecar stdout: {e}"));
+    }
     if stdout.trim().is_empty() {
-        *guard = None;
+        release_face_sidecar_slot(idx)?;
         return Err("face sidecar exited without a response".to_string());
     }
     let ok = parse_sidecar_ok_data(&stdout).is_ok();
+    return_face_sidecar(idx, process)?;
     Ok(SidecarResult {
         ok,
         stdout,
@@ -1753,19 +1885,20 @@ fn cluster_faces(
     if ids.len() > 25 {
         return Err("Too many images for one face-clustering call; use Guided Face Setup.".into());
     }
-    process_face_paths(app, Some(ids), false, true)
+    process_face_paths(app, Some(ids), false, true, 1)
 }
 fn process_face_paths(
     app: tauri::AppHandle,
     media_ids: Option<Vec<i64>>,
     auto_name_clusters: bool,
     auto_assign_identity: bool,
+    face_sidecar_pool_size: usize,
 ) -> Result<SidecarResult, String> {
     let mut conn = open_db(&app)?;
     let rows = media_paths_for_ids(&conn, media_ids, true)?;
     let paths: Vec<String> = rows.iter().map(|(_, p)| p.clone()).collect();
     let payload = serde_json::json!({"paths":paths}).to_string();
-    let res = run_face_sidecar(&payload)?;
+    let res = run_face_sidecar(&payload, face_sidecar_pool_size)?;
     if res.ok {
         let root: serde_json::Value =
             serde_json::from_str(&res.stdout).map_err(|e| format!("invalid sidecar JSON: {e}"))?;
@@ -1835,10 +1968,28 @@ fn process_face_paths(
 }
 #[tauri::command]
 fn process_face_setup_image(app: tauri::AppHandle, media_id: i64) -> Result<SidecarResult, String> {
-    process_face_paths(app, Some(vec![media_id]), false, true)
+    process_face_paths(app, Some(vec![media_id]), false, true, 1)
 }
 #[tauri::command]
-fn generate_embeddings(
+async fn generate_embeddings(
+    app: tauri::AppHandle,
+    media_ids: Option<Vec<i64>>,
+    provider: Option<String>,
+    model: Option<String>,
+    image_max_width: Option<u32>,
+) -> Result<SidecarResult, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        generate_embeddings_impl(app, media_ids, provider, model, image_max_width)
+    })
+    .await
+    .map_err(|e| {
+        let msg = format!("embedding task failed/thread panicked: {e}");
+        backend_log(&msg);
+        msg
+    })?
+}
+
+fn generate_embeddings_impl(
     app: tauri::AppHandle,
     media_ids: Option<Vec<i64>>,
     provider: Option<String>,
@@ -1846,40 +1997,83 @@ fn generate_embeddings(
     image_max_width: Option<u32>,
 ) -> Result<SidecarResult, String> {
     let mut conn = open_db(&app)?;
-    let rows = media_paths_for_ids(&conn, media_ids, false)?;
-    let paths: Vec<String> = rows.iter().map(|(_, p)| p.clone()).collect();
-    let payload = serde_json::json!({"paths":paths}).to_string();
-    let args = vec![
-        "embed".into(),
-        "--provider".into(),
-        provider.unwrap_or_else(|| "ollama".into()),
-        "--model".into(),
-        model.unwrap_or_else(|| "nomic-embed-text".into()),
-        "--workers".into(),
-        indexing_thread_count().to_string(),
-        "--json".into(),
-        payload,
-    ];
-    let args = if let Some(width) = image_max_width.filter(|w| *w > 0) {
-        let mut args = args;
-        args.push("--image-max-width".into());
-        args.push(width.to_string());
-        args
-    } else {
-        args
+    let selected_provider = provider.unwrap_or_else(|| "fastembed".into());
+    let selected_model = model.unwrap_or_else(|| "Qdrant/clip-ViT-B-32".into());
+    let rows = media_paths_for_ids(&conn, media_ids, selected_provider == "fastembed")?;
+    let total = rows.len();
+    let mut summary = ScanSummary::default();
+    emit_scan_progress(
+        &app,
+        &summary,
+        "Generating embeddings",
+        None,
+        total,
+        Some(total),
+        0,
+        None,
+        false,
+    );
+    if total == 0 {
+        emit_scan_progress(
+            &app,
+            &summary,
+            "Embeddings complete",
+            None,
+            total,
+            Some(total),
+            0,
+            None,
+            true,
+        );
+        return Ok(SidecarResult {
+            ok: true,
+            stdout: "{\"ok\":true,\"data\":{\"embedded\":0,\"skipped\":0}}".into(),
+            stderr: String::new(),
+        });
+    }
+    let mut inserted = 0usize;
+    let mut skipped = 0usize;
+    let mut last_res = SidecarResult {
+        ok: true,
+        stdout: String::new(),
+        stderr: String::new(),
     };
-    let res = run_sidecar(args)?;
-    if res.ok {
+    for chunk in rows.chunks(EMBEDDING_BATCH_SIZE) {
+        let paths: Vec<String> = chunk.iter().map(|(_, p)| p.clone()).collect();
+        let payload = serde_json::json!({"paths":paths});
+        let mut args = vec![
+            "embed".into(),
+            "--provider".into(),
+            selected_provider.clone(),
+            "--model".into(),
+            selected_model.clone(),
+            "--workers".into(),
+            embedding_thread_count(&selected_provider).to_string(),
+            "--batch-size".into(),
+            embedding_batch_size(&selected_provider).to_string(),
+        ];
+        if let Some(width) = image_max_width.filter(|w| *w > 0) {
+            args.push("--image-max-width".into());
+            args.push(width.to_string());
+        }
+        let res = run_sidecar_json_payload(args, &payload)?;
+        if !res.ok {
+            summary.errors.push(res.stderr.clone());
+            last_res = res;
+            break;
+        }
         let root: serde_json::Value =
             serde_json::from_str(&res.stdout).map_err(|e| format!("invalid sidecar JSON: {e}"))?;
         if let Some(embs) = root.pointer("/data/embeddings").and_then(|v| v.as_array()) {
+            let path_to_id: HashMap<&str, i64> =
+                chunk.iter().map(|(id, p)| (p.as_str(), *id)).collect();
             let tx = conn.transaction().map_err(|e| e.to_string())?;
             for emb in embs {
                 let src = emb
                     .get("source")
                     .and_then(|v| v.as_str())
                     .unwrap_or_default();
-                let Some((mid, _)) = rows.iter().find(|(_, p)| p == src) else {
+                let Some(mid) = path_to_id.get(src) else {
                     continue;
                 };
                 let model = emb
@@ -1891,15 +2085,48 @@ fn generate_embeddings(
                     .and_then(|v| v.as_array())
                     .filter(|v| !v.is_empty())
                 else {
+                    skipped += 1;
                     continue;
                 };
                 let vec_json = serde_json::to_vec(vecv).map_err(|e| e.to_string())?;
                 tx.execute("INSERT INTO embeddings(media_item_id,model,vector,created_at) VALUES(?1,?2,?3,?4)",params![mid,model,vec_json,now_unix()]).map_err(|e|e.to_string())?;
+                inserted += 1;
             }
             tx.commit().map_err(|e| e.to_string())?;
         }
+        summary.scanned_files += chunk.len();
+        summary.imported_or_updated = inserted;
+        summary.skipped_files = skipped + summary.scanned_files.saturating_sub(inserted + skipped);
+        emit_scan_progress(
+            &app,
+            &summary,
+            "Generating embeddings",
+            chunk.last().map(|(_, p)| p.clone()),
+            total,
+            Some(total),
+            0,
+            None,
+            false,
+        );
+        last_res = res;
     }
-    Ok(res)
+    summary.imported_or_updated = inserted;
+    summary.skipped_files = total.saturating_sub(inserted);
+    emit_scan_progress(
+        &app,
+        &summary,
+        "Embeddings complete",
+        None,
+        total,
+        Some(total),
+        0,
+        None,
+        true,
+    );
+    if last_res.ok {
+        last_res.stdout = serde_json::json!({"ok":true,"data":{"embedded":inserted,"skipped":summary.skipped_files,"total":total}}).to_string();
+    }
+    Ok(last_res)
 }
 fn parse_vec(b: Vec<u8>) -> Option<Vec<f32>> {
     serde_json::from_slice(&b).ok().or_else(|| {
@@ -1977,7 +2204,7 @@ fn search_semantic_text(
     model: Option<String>,
     limit: Option<i64>,
 ) -> Result<Vec<SemanticHit>, String> {
-    let selected_model = model.unwrap_or_else(|| "nomic-embed-text".into());
+    let selected_model = model.unwrap_or_else(|| "Qdrant/clip-ViT-B-32".into());
     let c = open_db(&app)?;
     let n: i64 = c
         .query_row(
@@ -1993,7 +2220,7 @@ fn search_semantic_text(
     let args = vec![
         "embed".into(),
         "--provider".into(),
-        provider.unwrap_or_else(|| "ollama".into()),
+        provider.unwrap_or_else(|| "fastembed".into()),
         "--model".into(),
         selected_model.clone(),
         "--workers".into(),

@@ -3,9 +3,11 @@ pyproject.toml
 rich_media_sidecar/__init__.py
 rich_media_sidecar/__main__.py
 rich_media_sidecar/clustering.py
+rich_media_sidecar/insightface_engine.py
 rich_media_sidecar/providers.py
 rich_media_viewer_sidecar.egg-info/PKG-INFO
 rich_media_viewer_sidecar.egg-info/SOURCES.txt
 rich_media_viewer_sidecar.egg-info/dependency_links.txt
 rich_media_viewer_sidecar.egg-info/entry_points.txt
+rich_media_viewer_sidecar.egg-info/requires.txt
 rich_media_viewer_sidecar.egg-info/top_level.txt

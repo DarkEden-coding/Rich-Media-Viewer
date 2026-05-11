@@ -6,3 +6,4 @@ insightface>=0.7.3
 onnxruntime-gpu[cuda,cudnn]>=1.21.0; platform_system == "Windows" or platform_system == "Linux"
 onnxruntime>=1.21.0; platform_system != "Windows" and platform_system != "Linux"
 faiss-cpu>=1.7.4
+fastembed>=0.7.0

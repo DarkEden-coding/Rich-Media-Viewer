@@ -15,7 +15,7 @@ Local-first desktop app for cataloging, searching, and viewing image/video libra
 - Grid/list results, image/video viewer, and OpenStreetMap links/embeds for GPS-tagged media.
 - Python sidecar integration for OpenCV face detection/clustering and provider-backed embeddings.
 - People naming/search through detected clusters.
-- Embedding generation and semantic text search over stored vectors with Ollama, Google, or OpenRouter providers.
+- Embedding generation and semantic text search over stored vectors with local FastEmbed, Google, or OpenRouter providers.
 
 ## Run in development
 
