@@ -4,11 +4,12 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashSet, VecDeque},
     fs,
+    io::{BufRead, BufReader, Write},
     path::{Path, PathBuf},
-    process::Command,
+    process::{Child, ChildStdin, ChildStdout, Command, Stdio},
     sync::{
         atomic::{AtomicUsize, Ordering},
-        mpsc, Arc, Mutex,
+        mpsc, Arc, Mutex, OnceLock,
     },
     thread,
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -17,10 +18,15 @@ use tauri::Emitter;
 #[cfg(not(debug_assertions))]
 use tauri::Manager;
 use tauri_plugin_dialog::DialogExt;
+use tauri_plugin_window_state::StateFlags;
 
 const DB_FILE: &str = "rich-media-viewer.sqlite3";
+/// Cosine threshold for InsightFace `buffalo_l` L2-normalized embeddings (inner product).
+const INSIGHTFACE_FACE_MATCH_THRESHOLD: f64 = 0.42;
+const FACE_EMBEDDING_MODEL: &str = "insightface-buffalo_l";
 const DISCOVERY_THREAD_MULTIPLIER: usize = 4;
 const INDEXING_THREAD_DIVISOR: usize = 2;
+static FACE_SIDECAR: OnceLock<Mutex<Option<FaceSidecarProcess>>> = OnceLock::new();
 
 fn backend_log(message: &str) {
     eprintln!("[rich-media-viewer backend] {message}");
@@ -43,6 +49,13 @@ fn indexing_thread_count() -> usize {
         .and_then(|v| v.parse().ok())
         .unwrap_or_else(|| (available_threads() / INDEXING_THREAD_DIVISOR).max(1))
         .clamp(1, 4)
+}
+fn face_indexing_thread_count() -> usize {
+    std::env::var("RMV_FACE_THREADS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or_else(|| indexing_thread_count().max(2))
+        .clamp(1, 8)
 }
 const BLACKLISTED_FOLDER_NAMES: &[&str] = &[
     "thumbnails",
@@ -143,10 +156,11 @@ struct SearchFilter {
     person_name: Option<String>,
     has_gps: Option<bool>,
     has_camera: Option<bool>,
+    sort_order: Option<String>,
     limit: Option<i64>,
     offset: Option<i64>,
 }
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Clone)]
 struct ScanSummary {
     scanned_files: usize,
     imported_or_updated: usize,
@@ -165,6 +179,10 @@ struct ScanProgress {
     errors: usize,
     discovered_files: usize,
     total_files: Option<usize>,
+    /// Images processed in the current / last face-embedding pass (parallel workers).
+    faces_done: usize,
+    /// Total images queued for face embedding in the current pass (`None` when not in that phase).
+    faces_total: Option<usize>,
     done: bool,
 }
 #[derive(Debug, Serialize)]
@@ -187,11 +205,20 @@ struct Face {
     confidence: Option<f64>,
     created_at: i64,
 }
+struct NamedFaceEmbedding {
+    person_id: i64,
+    embedding: Vec<f32>,
+}
 #[derive(Debug, Serialize)]
 struct SidecarResult {
     ok: bool,
     stdout: String,
     stderr: String,
+}
+struct FaceSidecarProcess {
+    child: Child,
+    stdin: ChildStdin,
+    stdout: BufReader<ChildStdout>,
 }
 #[derive(Debug, Serialize)]
 struct SemanticHit {
@@ -231,6 +258,8 @@ fn open_db(app: &tauri::AppHandle) -> Result<Connection, String> {
 }
 fn init_db(conn: &Connection) -> Result<(), String> {
     conn.execute_batch(r#"
+PRAGMA journal_mode=WAL;
+PRAGMA busy_timeout=60000;
 PRAGMA foreign_keys=ON;
 CREATE TABLE IF NOT EXISTS media_items(id INTEGER PRIMARY KEY AUTOINCREMENT,path TEXT NOT NULL UNIQUE,file_name TEXT NOT NULL,extension TEXT,media_type TEXT NOT NULL,size_bytes INTEGER,created_at INTEGER,modified_at INTEGER,imported_at INTEGER NOT NULL,missing INTEGER NOT NULL DEFAULT 0,camera_make TEXT,camera_model TEXT,latitude REAL,longitude REAL);
 CREATE INDEX IF NOT EXISTS idx_media_items_path ON media_items(path); CREATE INDEX IF NOT EXISTS idx_media_items_type ON media_items(media_type);
@@ -642,6 +671,151 @@ fn discover_files(
     ));
     (files, errors)
 }
+fn emit_scan_progress(
+    app: &tauri::AppHandle,
+    sum: &ScanSummary,
+    phase: &str,
+    current_path: Option<String>,
+    discovered_files: usize,
+    total_files: Option<usize>,
+    faces_done: usize,
+    faces_total: Option<usize>,
+    done: bool,
+) {
+    let _ = app.emit(
+        "scan-progress",
+        ScanProgress {
+            phase: phase.to_string(),
+            current_path,
+            scanned_files: sum.scanned_files,
+            imported_or_updated: sum.imported_or_updated,
+            skipped_files: sum.skipped_files,
+            missing_marked: sum.missing_marked,
+            errors: sum.errors.len(),
+            discovered_files,
+            total_files,
+            faces_done,
+            faces_total,
+            done,
+        },
+    );
+}
+fn list_image_media_ids(conn: &Connection) -> Result<Vec<i64>, String> {
+    let sql = format!(
+        "SELECT id FROM media_items WHERE missing=0 AND media_type='image'{} ORDER BY id",
+        sql_path_not_blacklisted_clause()
+    );
+    let mut s = conn.prepare(&sql).map_err(|e| e.to_string())?;
+    let rows: Vec<i64> = s
+        .query_map([], |r| r.get(0))
+        .map_err(|e| e.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())?;
+    Ok(rows)
+}
+const FACE_INDEX_BATCH: usize = 6;
+fn run_face_embedding_index_phase(
+    app: &tauri::AppHandle,
+    sum: &mut ScanSummary,
+    discovered_files: usize,
+    total_files: Option<usize>,
+) -> Result<(), String> {
+    let conn = open_db(app)?;
+    let media_ids = list_image_media_ids(&conn)?;
+    let total_face = media_ids.len();
+    let face_threads = face_indexing_thread_count();
+    if total_face == 0 {
+        emit_scan_progress(
+            app,
+            sum,
+            "Face embeddings (no indexed images)",
+            None,
+            discovered_files,
+            total_files,
+            0,
+            Some(0),
+            false,
+        );
+        return Ok(());
+    }
+    let progress_base = sum.clone();
+    emit_scan_progress(
+        app,
+        &progress_base,
+        &format!("Face embeddings — {face_threads} parallel workers"),
+        None,
+        discovered_files,
+        total_files,
+        0,
+        Some(total_face),
+        false,
+    );
+    let batches: Vec<Vec<i64>> = media_ids
+        .chunks(FACE_INDEX_BATCH)
+        .map(|c| c.to_vec())
+        .collect();
+    let done = AtomicUsize::new(0);
+    let errors: Mutex<Vec<String>> = Mutex::new(vec![]);
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(face_threads)
+        .build()
+        .map_err(|e| format!("face thread pool: {e}"))?;
+    let app_c = app.clone();
+    pool.install(|| {
+        batches.par_iter().for_each(|chunk| {
+            match process_face_paths(app_c.clone(), Some(chunk.clone()), false, true) {
+                Ok(r) if r.ok => {
+                    let now = done.fetch_add(chunk.len(), Ordering::Relaxed) + chunk.len();
+                    emit_scan_progress(
+                        &app_c,
+                        &progress_base,
+                        &format!("Face embeddings ({face_threads} workers)"),
+                        None,
+                        discovered_files,
+                        total_files,
+                        now,
+                        Some(total_face),
+                        false,
+                    );
+                }
+                Ok(r) => {
+                    let msg = format!(
+                        "face batch ids {:?}: sidecar failed: {}",
+                        chunk,
+                        r.stderr.trim()
+                    );
+                    backend_log(&msg);
+                    if let Ok(mut g) = errors.lock() {
+                        g.push(msg);
+                    }
+                }
+                Err(e) => {
+                    let msg = format!("face batch ids {:?}: {e}", chunk);
+                    backend_log(&msg);
+                    if let Ok(mut g) = errors.lock() {
+                        g.push(msg);
+                    }
+                }
+            }
+        });
+    });
+    let mut batch_errors = errors
+        .into_inner()
+        .map_err(|_| "face errors mutex poisoned".to_string())?;
+    sum.errors.append(&mut batch_errors);
+    emit_scan_progress(
+        app,
+        &sum.clone(),
+        "Face embeddings complete",
+        None,
+        discovered_files,
+        total_files,
+        total_face,
+        Some(total_face),
+        false,
+    );
+    Ok(())
+}
 fn scan_library_impl(app: tauri::AppHandle, paths: Vec<String>) -> Result<ScanSummary, String> {
     const PROGRESS_FILES_PER_INDEXING_THREAD: usize = 20;
 
@@ -656,34 +830,15 @@ fn scan_library_impl(app: tauri::AppHandle, paths: Vec<String>) -> Result<ScanSu
     let mut seen = HashSet::new();
     let mut discovered_files = 0usize;
     let mut total_files = None;
-    let emit_progress = |sum: &ScanSummary,
-                         phase: &str,
-                         current_path: Option<String>,
-                         discovered_files: usize,
-                         total_files: Option<usize>,
-                         done: bool| {
-        let _ = app.emit(
-            "scan-progress",
-            ScanProgress {
-                phase: phase.into(),
-                current_path,
-                scanned_files: sum.scanned_files,
-                imported_or_updated: sum.imported_or_updated,
-                skipped_files: sum.skipped_files,
-                missing_marked: sum.missing_marked,
-                errors: sum.errors.len(),
-                discovered_files,
-                total_files,
-                done,
-            },
-        );
-    };
-    emit_progress(
+    emit_scan_progress(
+        &app,
         &sum,
         "Starting scan",
         None,
         discovered_files,
         total_files,
+        0,
+        None,
         false,
     );
     let discovery_threads = discovery_thread_count();
@@ -698,12 +853,15 @@ fn scan_library_impl(app: tauri::AppHandle, paths: Vec<String>) -> Result<ScanSu
         indexing_threads
     ));
     for root in paths {
-        emit_progress(
+        emit_scan_progress(
+            &app,
             &sum,
             &format!("Discovering files ({discovery_threads} discovery threads; {indexing_threads} indexing threads)"),
             Some(root.clone()),
             discovered_files,
             total_files,
+            0,
+            None,
             false,
         );
         backend_log(&format!("scan root requested: {root}"));
@@ -712,12 +870,15 @@ fn scan_library_impl(app: tauri::AppHandle, paths: Vec<String>) -> Result<ScanSu
             let msg = format!("scan root does not exist: {root}");
             backend_log(&msg);
             sum.errors.push(msg);
-            emit_progress(
+            emit_scan_progress(
+                &app,
                 &sum,
                 "Folder missing",
                 Some(root),
                 discovered_files,
                 total_files,
+                0,
+                None,
                 false,
             );
             continue;
@@ -726,12 +887,15 @@ fn scan_library_impl(app: tauri::AppHandle, paths: Vec<String>) -> Result<ScanSu
             let msg = format!("scan root is not a directory: {root}");
             backend_log(&msg);
             sum.errors.push(msg);
-            emit_progress(
+            emit_scan_progress(
+                &app,
                 &sum,
                 "Not a directory",
                 Some(root),
                 discovered_files,
                 total_files,
+                0,
+                None,
                 false,
             );
             continue;
@@ -750,12 +914,15 @@ fn scan_library_impl(app: tauri::AppHandle, paths: Vec<String>) -> Result<ScanSu
             files.len(),
             sum.errors.len()
         ));
-        emit_progress(
+        emit_scan_progress(
+            &app,
             &sum,
             &format!("Indexing metadata ({indexing_threads} indexing threads; discovery used {discovery_threads})"),
             files.first().map(|p| clean_path_string(p)),
             discovered_files,
             total_files,
+            0,
+            None,
             false,
         );
         let pool = rayon::ThreadPoolBuilder::new()
@@ -798,23 +965,29 @@ fn scan_library_impl(app: tauri::AppHandle, paths: Vec<String>) -> Result<ScanSu
                 }
             }
             if results % progress_emit_interval == 0 {
-                emit_progress(
+                emit_scan_progress(
+                    &app,
                     &sum,
                     "Indexing metadata",
                     pending_progress_path.as_ref().map(|p| clean_path_string(p)),
                     discovered_files,
                     total_files,
+                    0,
+                    None,
                     false,
                 );
             }
         }
         if results > 0 && results % progress_emit_interval != 0 {
-            emit_progress(
+            emit_scan_progress(
+                &app,
                 &sum,
                 "Indexing metadata",
                 pending_progress_path.as_ref().map(|p| clean_path_string(p)),
                 discovered_files,
                 total_files,
+                0,
+                None,
                 false,
             );
         }
@@ -830,16 +1003,20 @@ fn scan_library_impl(app: tauri::AppHandle, paths: Vec<String>) -> Result<ScanSu
             "root {root}: metadata indexing complete results={results}"
         ));
     }
-    emit_progress(
+    emit_scan_progress(
+        &app,
         &sum,
         "Checking missing files",
         None,
         discovered_files,
         total_files,
+        0,
+        None,
         false,
     );
     backend_log("checking missing files");
     sum.missing_marked = mark_missing_internal(&conn)?;
+    run_face_embedding_index_phase(&app, &mut sum, discovered_files, total_files)?;
     backend_log(&format!(
         "scan complete scanned={} imported_or_updated={} skipped={} missing_marked={} errors={}",
         sum.scanned_files,
@@ -848,12 +1025,15 @@ fn scan_library_impl(app: tauri::AppHandle, paths: Vec<String>) -> Result<ScanSu
         sum.missing_marked,
         sum.errors.len()
     ));
-    emit_progress(
+    emit_scan_progress(
+        &app,
         &sum,
         "Scan complete",
         None,
         discovered_files,
         total_files,
+        0,
+        None,
         true,
     );
     Ok(sum)
@@ -867,6 +1047,50 @@ async fn scan_library(app: tauri::AppHandle, paths: Vec<String>) -> Result<ScanS
             backend_log(&msg);
             msg
         })?
+}
+#[tauri::command]
+async fn update_face_embeddings(app: tauri::AppHandle) -> Result<ScanSummary, String> {
+    match tauri::async_runtime::spawn_blocking(move || {
+        let mut sum = ScanSummary {
+            scanned_files: 0,
+            imported_or_updated: 0,
+            skipped_files: 0,
+            missing_marked: 0,
+            errors: vec![],
+        };
+        let discovered_files = 0usize;
+        let total_files: Option<usize> = None;
+        emit_scan_progress(
+            &app,
+            &sum,
+            "Updating face embeddings",
+            None,
+            discovered_files,
+            total_files,
+            0,
+            None,
+            false,
+        );
+        run_face_embedding_index_phase(&app, &mut sum, discovered_files, total_files)?;
+        emit_scan_progress(
+            &app,
+            &sum,
+            "Face embedding update finished",
+            None,
+            discovered_files,
+            total_files,
+            0,
+            None,
+            true,
+        );
+        Ok(sum)
+    })
+    .await
+    {
+        Ok(Ok(s)) => Ok(s),
+        Ok(Err(e)) => Err(e),
+        Err(e) => Err(format!("face update task failed: {e}")),
+    }
 }
 fn mark_missing_internal(conn: &Connection) -> Result<usize, String> {
     let mut s = conn
@@ -990,7 +1214,18 @@ fn search_media(app: tauri::AppHandle, filter: SearchFilter) -> Result<Vec<Media
             v.push(Box::new(max_lng));
         }
     }
-    sql.push_str(" ORDER BY COALESCE(captured_at,modified_at,created_at) DESC,id DESC");
+    let sort_dir = if filter
+        .sort_order
+        .as_deref()
+        .is_some_and(|order| order.eq_ignore_ascii_case("asc"))
+    {
+        "ASC"
+    } else {
+        "DESC"
+    };
+    sql.push_str(&format!(
+        " ORDER BY COALESCE(captured_at,modified_at,created_at) {sort_dir},id {sort_dir}"
+    ));
     if radius_filter.is_none() {
         sql.push_str(" LIMIT ? OFFSET ?");
         v.push(Box::new(filter.limit.unwrap_or(100).clamp(1, 500)));
@@ -1069,6 +1304,17 @@ fn rename_person(app: tauri::AppHandle, person_id: i64, name: String) -> Result<
         .map_err(|e| e.to_string())?;
     Ok(())
 }
+#[tauri::command]
+fn delete_person(app: tauri::AppHandle, person_id: i64) -> Result<(), String> {
+    let conn = open_db(&app)?;
+    let n = conn
+        .execute("DELETE FROM people WHERE id=?1", params![person_id])
+        .map_err(|e| e.to_string())?;
+    if n == 0 {
+        return Err("Person not found".to_string());
+    }
+    Ok(())
+}
 fn get_or_create_person(conn: &Connection, name: &str) -> Result<i64, String> {
     let trimmed = name.trim();
     let name = if trimmed.is_empty() {
@@ -1087,12 +1333,32 @@ fn get_or_create_person(conn: &Connection, name: &str) -> Result<i64, String> {
     .map_err(|e| e.to_string())
 }
 fn best_named_person_for_embedding(
-    conn: &Connection,
     embedding: &[f32],
+    named_faces: &[NamedFaceEmbedding],
     threshold: f64,
-) -> Result<Option<i64>, String> {
-    let mut s=conn.prepare("SELECT f.person_id,e.vector FROM embeddings e JOIN faces f ON f.id=e.face_id WHERE f.person_id IS NOT NULL").map_err(|e|e.to_string())?;
-    let mut best = (threshold, None);
+) -> Option<i64> {
+    let mut best_score = threshold;
+    let mut best_person_id = None;
+    for named_face in named_faces {
+        if named_face.embedding.len() != embedding.len() {
+            continue;
+        }
+        let score = cosine(embedding, &named_face.embedding);
+        if score >= best_score {
+            best_score = score;
+            best_person_id = Some(named_face.person_id);
+        }
+    }
+    best_person_id
+}
+fn load_named_face_embeddings(conn: &Connection) -> Result<Vec<NamedFaceEmbedding>, String> {
+    let mut s = conn
+        .prepare(
+            "SELECT f.person_id,e.vector FROM embeddings e JOIN faces f ON f.id=e.face_id \
+             WHERE f.person_id IS NOT NULL",
+        )
+        .map_err(|e| e.to_string())?;
+    let mut named_faces = vec![];
     for r in s
         .query_map([], |row| {
             Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?))
@@ -1101,46 +1367,92 @@ fn best_named_person_for_embedding(
     {
         let (pid, blob) = r.map_err(|e| e.to_string())?;
         if let Some(v) = parse_vec(blob) {
-            let score = cosine(embedding, &v);
-            if score > best.0 {
-                best = (score, Some(pid));
-            }
+            named_faces.push(NamedFaceEmbedding {
+                person_id: pid,
+                embedding: v,
+            });
         }
     }
-    Ok(best.1)
+    Ok(named_faces)
 }
 fn propagate_person(
     conn: &Connection,
     person_id: i64,
     seed: &[f32],
     threshold: f64,
+    exclude_media_item_id: i64,
 ) -> Result<usize, String> {
-    let mut s=conn.prepare("SELECT e.face_id,e.vector FROM embeddings e JOIN faces f ON f.id=e.face_id WHERE f.person_id IS NULL").map_err(|e|e.to_string())?;
+    let mut s = conn
+        .prepare(
+            "SELECT e.face_id,e.vector,f.media_item_id FROM embeddings e JOIN faces f ON f.id=e.face_id \
+             WHERE f.person_id IS NULL AND f.media_item_id != ?1",
+        )
+        .map_err(|e| e.to_string())?;
     let rows = s
-        .query_map([], |row| {
-            Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?))
+        .query_map(params![exclude_media_item_id], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, Vec<u8>>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
         })
         .map_err(|e| e.to_string())?
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| e.to_string())?;
-    let mut n = 0;
-    for (face_id, blob) in rows {
+    let mut candidates: Vec<serde_json::Value> = vec![];
+    for (face_id, blob, media_item_id) in rows {
         if let Some(v) = parse_vec(blob) {
-            if cosine(seed, &v) >= threshold {
-                conn.execute(
-                    "UPDATE faces SET person_id=?1 WHERE id=?2",
-                    params![person_id, face_id],
-                )
-                .map_err(|e| e.to_string())?;
-                n += 1;
+            if v.len() != seed.len() {
+                continue;
             }
+            candidates.push(serde_json::json!({
+                "face_id": face_id,
+                "media_item_id": media_item_id,
+                "embedding": v
+            }));
         }
+    }
+    if candidates.is_empty() {
+        return Ok(0);
+    }
+    let payload = serde_json::json!({
+        "mode": "propagate",
+        "seed": seed,
+        "threshold": threshold,
+        "exclude_media_item_id": exclude_media_item_id,
+        "candidates": candidates
+    });
+    let res = run_sidecar_stdin(&payload.to_string())?;
+    if !res.ok {
+        return Err(format!("face-match sidecar failed: {}", res.stderr.trim()));
+    }
+    let data = parse_sidecar_ok_data(&res.stdout)?;
+    let ids: Vec<i64> = data
+        .get("matching_face_ids")
+        .and_then(|v| v.as_array())
+        .map(|arr| arr.iter().filter_map(|x| x.as_i64()).collect::<Vec<_>>())
+        .unwrap_or_default();
+    let mut n = 0usize;
+    for face_id in ids {
+        conn.execute(
+            "UPDATE faces SET person_id=?1 WHERE id=?2",
+            params![person_id, face_id],
+        )
+        .map_err(|e| e.to_string())?;
+        n += 1;
     }
     Ok(n)
 }
 #[tauri::command]
 fn name_face(app: tauri::AppHandle, face_id: i64, name: String) -> Result<usize, String> {
     let conn = open_db(&app)?;
+    let media_item_id: i64 = conn
+        .query_row(
+            "SELECT media_item_id FROM faces WHERE id=?1",
+            params![face_id],
+            |r| r.get(0),
+        )
+        .map_err(|e| e.to_string())?;
     let pid = get_or_create_person(&conn, &name)?;
     conn.execute(
         "UPDATE faces SET person_id=?1 WHERE id=?2",
@@ -1157,7 +1469,13 @@ fn name_face(app: tauri::AppHandle, face_id: i64, name: String) -> Result<usize,
         .map_err(|e| e.to_string())?
         .ok_or_else(|| "face has no embedding yet".to_string())?;
     let seed = parse_vec(blob).ok_or_else(|| "invalid face embedding".to_string())?;
-    propagate_person(&conn, pid, &seed, 0.88)
+    propagate_person(
+        &conn,
+        pid,
+        &seed,
+        INSIGHTFACE_FACE_MATCH_THRESHOLD,
+        media_item_id,
+    )
 }
 #[tauri::command]
 fn list_faces(
@@ -1204,21 +1522,34 @@ fn sidecar_dir() -> Result<PathBuf, String> {
         .ok_or_else(|| "failed to resolve repo root".to_string())?
         .join("python-sidecar"))
 }
+fn sidecar_python(dir: &Path) -> PathBuf {
+    let windows_python = dir.join(".venv").join("Scripts").join("python.exe");
+    if windows_python.exists() {
+        return windows_python;
+    }
+    let unix_python = dir.join(".venv").join("bin").join("python");
+    if unix_python.exists() {
+        return unix_python;
+    }
+    PathBuf::from("python3")
+}
+fn sidecar_command(dir: &Path) -> Command {
+    let mut command = Command::new(sidecar_python(dir));
+    command
+        .arg("-m")
+        .arg("rich_media_sidecar")
+        .current_dir(dir)
+        .env("PYTHONPATH", dir.to_string_lossy().to_string());
+    command
+}
 fn run_sidecar(args: Vec<String>) -> Result<SidecarResult, String> {
     let dir = sidecar_dir()?;
     backend_log(&format!("running python sidecar args={args:?}"));
-    let out = Command::new("python3")
-        .arg("-m")
-        .arg("rich_media_sidecar")
-        .args(args)
-        .current_dir(&dir)
-        .env("PYTHONPATH", dir.to_string_lossy().to_string())
-        .output()
-        .map_err(|e| {
-            let msg = format!("failed to run python sidecar: {e}");
-            backend_log(&msg);
-            msg
-        })?;
+    let out = sidecar_command(&dir).args(args).output().map_err(|e| {
+        let msg = format!("failed to run python sidecar: {e}");
+        backend_log(&msg);
+        msg
+    })?;
     let stdout = String::from_utf8_lossy(&out.stdout).to_string();
     let stderr = String::from_utf8_lossy(&out.stderr).to_string();
     if !out.status.success() || !stderr.trim().is_empty() {
@@ -1233,6 +1564,138 @@ fn run_sidecar(args: Vec<String>) -> Result<SidecarResult, String> {
         stdout,
         stderr,
     })
+}
+
+fn spawn_face_sidecar(dir: &Path) -> Result<FaceSidecarProcess, String> {
+    backend_log("starting persistent python face sidecar");
+    let mut child = sidecar_command(dir)
+        .arg("serve-faces")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .map_err(|e| {
+            let msg = format!("failed to spawn persistent face sidecar: {e}");
+            backend_log(&msg);
+            msg
+        })?;
+    let stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| "failed to open face sidecar stdin".to_string())?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| "failed to open face sidecar stdout".to_string())?;
+    Ok(FaceSidecarProcess {
+        child,
+        stdin,
+        stdout: BufReader::new(stdout),
+    })
+}
+fn run_face_sidecar(payload: &str) -> Result<SidecarResult, String> {
+    let dir = sidecar_dir()?;
+    let mutex = FACE_SIDECAR.get_or_init(|| Mutex::new(None));
+    let mut guard = mutex
+        .lock()
+        .map_err(|_| "face sidecar mutex poisoned".to_string())?;
+    let needs_spawn = guard
+        .as_mut()
+        .and_then(|process| process.child.try_wait().ok().flatten())
+        .is_some()
+        || guard.is_none();
+    if needs_spawn {
+        *guard = Some(spawn_face_sidecar(&dir)?);
+    }
+    let process = guard
+        .as_mut()
+        .ok_or_else(|| "face sidecar unavailable".to_string())?;
+    if let Err(exc) = writeln!(process.stdin, "{payload}").and_then(|_| process.stdin.flush()) {
+        backend_log(&format!(
+            "restarting face sidecar after write failure: {exc}"
+        ));
+        *process = spawn_face_sidecar(&dir)?;
+        writeln!(process.stdin, "{payload}")
+            .and_then(|_| process.stdin.flush())
+            .map_err(|e| format!("failed to write face sidecar stdin: {e}"))?;
+    }
+    let mut stdout = String::new();
+    process
+        .stdout
+        .read_line(&mut stdout)
+        .map_err(|e| format!("failed to read face sidecar stdout: {e}"))?;
+    if stdout.trim().is_empty() {
+        *guard = None;
+        return Err("face sidecar exited without a response".to_string());
+    }
+    let ok = parse_sidecar_ok_data(&stdout).is_ok();
+    Ok(SidecarResult {
+        ok,
+        stdout,
+        stderr: String::new(),
+    })
+}
+
+fn run_sidecar_stdin(stdin_body: &str) -> Result<SidecarResult, String> {
+    let dir = sidecar_dir()?;
+    backend_log("running python sidecar face-match --stdin");
+    let mut child = sidecar_command(&dir)
+        .arg("face-match")
+        .arg("--stdin")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| {
+            let msg = format!("failed to spawn python sidecar: {e}");
+            backend_log(&msg);
+            msg
+        })?;
+    child
+        .stdin
+        .take()
+        .ok_or_else(|| "failed to open sidecar stdin".to_string())?
+        .write_all(stdin_body.as_bytes())
+        .map_err(|e| format!("failed to write sidecar stdin: {e}"))?;
+    let out = child
+        .wait_with_output()
+        .map_err(|e| format!("failed to read sidecar output: {e}"))?;
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+    if !out.status.success() || !stderr.trim().is_empty() {
+        backend_log(&format!(
+            "python sidecar status={} stderr={}",
+            out.status,
+            stderr.trim()
+        ));
+    }
+    Ok(SidecarResult {
+        ok: out.status.success(),
+        stdout,
+        stderr,
+    })
+}
+
+fn parse_sidecar_ok_data(stdout: &str) -> Result<serde_json::Value, String> {
+    let v: serde_json::Value = serde_json::from_str(stdout.trim()).map_err(|e| {
+        format!(
+            "invalid JSON from sidecar: {e}; stdout={}",
+            stdout.chars().take(500).collect::<String>()
+        )
+    })?;
+    match v.get("ok").and_then(|x| x.as_bool()) {
+        Some(true) => v
+            .get("data")
+            .cloned()
+            .ok_or_else(|| "sidecar response missing data".to_string()),
+        _ => {
+            let msg = v
+                .pointer("/error/message")
+                .and_then(|m| m.as_str())
+                .unwrap_or("sidecar returned ok=false");
+            Err(msg.to_string())
+        }
+    }
 }
 fn media_paths_for_ids(
     conn: &Connection,
@@ -1279,22 +1742,28 @@ fn cluster_faces(
     if ids.len() > 25 {
         return Err("Too many images for one face-clustering call; use Guided Face Setup.".into());
     }
-    process_face_paths(app, Some(ids), false)
+    process_face_paths(app, Some(ids), false, true)
 }
 fn process_face_paths(
     app: tauri::AppHandle,
     media_ids: Option<Vec<i64>>,
     auto_name_clusters: bool,
+    auto_assign_identity: bool,
 ) -> Result<SidecarResult, String> {
     let mut conn = open_db(&app)?;
     let rows = media_paths_for_ids(&conn, media_ids, true)?;
     let paths: Vec<String> = rows.iter().map(|(_, p)| p.clone()).collect();
     let payload = serde_json::json!({"paths":paths}).to_string();
-    let res = run_sidecar(vec!["cluster-faces".into(), "--json".into(), payload])?;
+    let res = run_face_sidecar(&payload)?;
     if res.ok {
         let root: serde_json::Value =
             serde_json::from_str(&res.stdout).map_err(|e| format!("invalid sidecar JSON: {e}"))?;
         if let Some(faces) = root.pointer("/data/faces").and_then(|v| v.as_array()) {
+            let named_faces = if auto_assign_identity {
+                load_named_face_embeddings(&conn)?
+            } else {
+                vec![]
+            };
             let tx = conn.transaction().map_err(|e| e.to_string())?;
             for (mid, _) in &rows {
                 tx.execute("DELETE FROM faces WHERE media_item_id=?1", params![mid])
@@ -1322,8 +1791,14 @@ fn process_face_paths(
                     )?)
                 } else if emb.is_empty() {
                     None
+                } else if auto_assign_identity {
+                    best_named_person_for_embedding(
+                        &emb,
+                        &named_faces,
+                        INSIGHTFACE_FACE_MATCH_THRESHOLD,
+                    )
                 } else {
-                    best_named_person_for_embedding(&tx, &emb, 0.88)?
+                    None
                 };
                 let bbox = face
                     .get("bbox")
@@ -1339,7 +1814,7 @@ fn process_face_paths(
                 let face_id = tx.last_insert_rowid();
                 if !emb.is_empty() {
                     let vec_json = serde_json::to_vec(&emb).map_err(|e| e.to_string())?;
-                    tx.execute("INSERT INTO embeddings(face_id,model,vector,created_at) VALUES(?1,'local-face',?2,?3)",params![face_id,vec_json,now_unix()]).map_err(|e|e.to_string())?;
+                    tx.execute("INSERT INTO embeddings(face_id,model,vector,created_at) VALUES(?1,?2,?3,?4)",params![face_id,FACE_EMBEDDING_MODEL,vec_json,now_unix()]).map_err(|e|e.to_string())?;
                 }
             }
             tx.commit().map_err(|e| e.to_string())?;
@@ -1349,7 +1824,7 @@ fn process_face_paths(
 }
 #[tauri::command]
 fn process_face_setup_image(app: tauri::AppHandle, media_id: i64) -> Result<SidecarResult, String> {
-    process_face_paths(app, Some(vec![media_id]), false)
+    process_face_paths(app, Some(vec![media_id]), false, true)
 }
 #[tauri::command]
 fn generate_embeddings(
@@ -1554,6 +2029,11 @@ fn greet(name: &str) -> String {
 }
 pub fn run() {
     tauri::Builder::default()
+        .plugin(
+            tauri_plugin_window_state::Builder::default()
+                .with_state_flags(StateFlags::POSITION | StateFlags::SIZE)
+                .build(),
+        )
         .plugin(tauri_plugin_dialog::init())
         .invoke_handler(tauri::generate_handler![
             greet,
@@ -1566,12 +2046,14 @@ pub fn run() {
             add_library_folder,
             remove_library_folder,
             scan_library,
+            update_face_embeddings,
             search_media,
             get_media_item,
             mark_missing,
             rescan,
             list_people,
             rename_person,
+            delete_person,
             name_face,
             list_faces,
             cluster_faces,

@@ -8,3 +8,6 @@ dev-data/
 __pycache__/
 *.pyc
 .venv/
+
+# InsightFace downloads these models on first use; keep large model binaries out of git.
+python-sidecar/rich_media_sidecar/models/

@@ -1,4 +1,8 @@
-# Lightweight local media intelligence dependencies
+# Local media intelligence + InsightFace / FAISS face pipeline
 numpy>=1.24
 Pillow>=10.0
 opencv-python-headless>=4.8
+insightface>=0.7.3
+onnxruntime-gpu[cuda,cudnn]>=1.21.0; platform_system == "Windows" or platform_system == "Linux"
+onnxruntime>=1.21.0; platform_system != "Windows" and platform_system != "Linux"
+faiss-cpu>=1.7.4

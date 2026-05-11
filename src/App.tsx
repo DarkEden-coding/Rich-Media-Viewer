@@ -53,6 +53,8 @@ type ScanProgress = {
   errors: number;
   discovered_files?: number;
   total_files?: number | null;
+  faces_done?: number;
+  faces_total?: number | null;
   done: boolean;
 };
 type Person = {
@@ -79,6 +81,7 @@ type GeoPoint = {
   longitude: number;
 };
 type ViewMode = "grid" | "list";
+type SortOrder = "desc" | "asc";
 
 const emptyFilters = {
   query: "",
@@ -321,6 +324,41 @@ function formatBytes(bytes?: number | null) {
 function formatDate(seconds?: number | null) {
   return seconds ? new Date(seconds * 1000).toLocaleString() : "Unknown";
 }
+function captureSortTime(item: MediaItem) {
+  return item.captured_at ?? item.modified_at ?? item.created_at ?? 0;
+}
+function compareMediaByDate(a: MediaItem, b: MediaItem, order: SortOrder) {
+  const dir = order === "asc" ? 1 : -1;
+  const byDate = (captureSortTime(a) - captureSortTime(b)) * dir;
+  return byDate || (a.id - b.id) * dir;
+}
+function mediaMonthLabel(seconds: number | null | undefined) {
+  if (!seconds) return "Unknown date";
+  return new Date(seconds * 1000).toLocaleDateString(undefined, {
+    year: "numeric",
+    month: "long",
+  });
+}
+function groupMediaByMonth(items: MediaItem[]) {
+  const groups: { key: string; label: string; items: MediaItem[] }[] = [];
+  for (const item of items) {
+    const seconds = captureSortTime(item);
+    const key = seconds
+      ? new Date(seconds * 1000).toISOString().slice(0, 7)
+      : "unknown";
+    const last = groups[groups.length - 1];
+    if (last?.key === key) {
+      last.items.push(item);
+    } else {
+      groups.push({
+        key,
+        label: mediaMonthLabel(seconds),
+        items: [item],
+      });
+    }
+  }
+  return groups;
+}
 function fileUrl(path: string) {
   try {
     return convertFileSrc(path);
@@ -359,6 +397,11 @@ function metaRows(item: MediaItem) {
   ];
 }
 function scanPercent(p: ScanProgress) {
+  const ft = p.faces_total;
+  if (ft != null && ft > 0) {
+    const done = p.faces_done ?? 0;
+    return Math.min(100, Math.max(0, (done / ft) * 100));
+  }
   const completed = p.scanned_files;
   return p.total_files
     ? Math.min(100, Math.max(0, (completed / p.total_files) * 100))
@@ -545,6 +588,7 @@ function App() {
   const [hasMoreItems, setHasMoreItems] = useState(true);
   const [selected, setSelected] = useState<MediaItem | null>(null);
   const [view, setView] = useState<ViewMode>("grid");
+  const [sortOrder, setSortOrder] = useState<SortOrder>("desc");
   const [loading, setLoading] = useState(false);
   const [scan, setScan] = useState<ScanSummary | null>(null);
   const [scanProgress, setScanProgress] = useState<ScanProgress | null>(null);
@@ -565,6 +609,7 @@ function App() {
   const searchRequestRef = useRef(0);
   const searchOffsetRef = useRef(0);
   const activeFilterRef = useRef(emptyFilters);
+  const activeSortOrderRef = useRef<SortOrder>("desc");
   const loadingMoreRef = useRef(false);
 
   const counts = useMemo(
@@ -576,6 +621,7 @@ function App() {
     }),
     [items],
   );
+  const groupedItems = useMemo(() => groupMediaByMonth(items), [items]);
   const updateFilter = (key: keyof typeof emptyFilters, value: string) =>
     setFilters((f) => ({ ...f, [key]: value }));
   const statData = [
@@ -625,7 +671,7 @@ function App() {
     setRegionOpen(false);
     void runSearch(next);
   }
-  function buildSearchFilter(next = filters, offset = 0) {
+  function buildSearchFilter(next = filters, offset = 0, order = sortOrder) {
     return {
       query: next.query || undefined,
       media_type: next.mediaType || undefined,
@@ -640,13 +686,15 @@ function App() {
       person_name: next.personName || undefined,
       has_gps: next.hasGps === "" ? undefined : next.hasGps === "true",
       has_camera: next.hasCamera === "" ? undefined : next.hasCamera === "true",
+      sort_order: order,
       limit: PAGE_SIZE,
       offset,
     };
   }
-  async function runSearch(next = filters) {
+  async function runSearch(next = filters, order = sortOrder) {
     const requestId = ++searchRequestRef.current;
     activeFilterRef.current = next;
+    activeSortOrderRef.current = order;
     searchOffsetRef.current = 0;
     loadingMoreRef.current = false;
     setHasMoreItems(true);
@@ -664,7 +712,9 @@ function App() {
             },
           );
           if (semantic.length) {
-            const result = semantic.map((hit) => hit.item);
+            const result = semantic
+              .map((hit) => hit.item)
+              .sort((a, b) => compareMediaByDate(a, b, order));
             if (requestId !== searchRequestRef.current) return;
             setItems(result);
             searchOffsetRef.current = result.length;
@@ -680,7 +730,7 @@ function App() {
       }
       setItems([]);
       const result = await invoke<MediaItem[]>("search_media", {
-        filter: buildSearchFilter(next, 0),
+        filter: buildSearchFilter(next, 0, order),
       });
       if (requestId !== searchRequestRef.current) return;
       searchOffsetRef.current = result.length;
@@ -701,7 +751,11 @@ function App() {
     loadingMoreRef.current = true;
     try {
       const result = await invoke<MediaItem[]>("search_media", {
-        filter: buildSearchFilter(activeFilterRef.current, offset),
+        filter: buildSearchFilter(
+          activeFilterRef.current,
+          offset,
+          activeSortOrderRef.current,
+        ),
       });
       if (requestId !== searchRequestRef.current) return;
       searchOffsetRef.current = offset + result.length;
@@ -722,6 +776,10 @@ function App() {
     if (el.scrollHeight - el.scrollTop - el.clientHeight < 1600)
       void loadMoreItems();
   }
+  function changeSortOrder(order: SortOrder) {
+    setSortOrder(order);
+    void runSearch(activeFilterRef.current, order);
+  }
   useEffect(() => {
     invoke<AppInfo>("initialize_app")
       .then(async (info) => {
@@ -740,8 +798,13 @@ function App() {
   useEffect(() => {
     const unlisten = listen<ScanProgress>("scan-progress", (e) => {
       setScanProgress(e.payload);
+      const p = e.payload;
+      const faceLine =
+        p.faces_total != null && p.faces_total > 0
+          ? ` · faces ${p.faces_done ?? 0}/${p.faces_total}`
+          : "";
       setNotice(
-        `${e.payload.phase}: ${e.payload.scanned_files} scanned, ${e.payload.imported_or_updated} imported`,
+        `${p.phase}: ${p.scanned_files} scanned, ${p.imported_or_updated} imported${faceLine}`,
       );
     });
     return () => {
@@ -794,6 +857,8 @@ function App() {
       errors: 0,
       discovered_files: 0,
       total_files: null,
+      faces_done: 0,
+      faces_total: null,
       done: false,
     });
     setNotice("Scanning library…");
@@ -811,6 +876,45 @@ function App() {
       setNotice(`Scan failed: ${String(e)}`);
     } finally {
       setLoading(false);
+      setScanProgress(null);
+    }
+  }
+  async function updateFaceEmbeddings() {
+    if (!indexExists) {
+      setNotice("Scan the library first to build an index.");
+      return;
+    }
+    setLoading(true);
+    setScanProgress({
+      phase: "Updating face embeddings",
+      current_path: null,
+      scanned_files: 0,
+      imported_or_updated: 0,
+      skipped_files: 0,
+      missing_marked: 0,
+      errors: 0,
+      discovered_files: 0,
+      total_files: null,
+      faces_done: 0,
+      faces_total: null,
+      done: false,
+    });
+    setNotice("Updating face embeddings…");
+    try {
+      const summary = await invoke<ScanSummary>("update_face_embeddings");
+      const errN = summary.errors?.length ?? 0;
+      setNotice(
+        errN
+          ? `Face embeddings updated with ${errN} error(s). Check the index log if faces look wrong.`
+          : "Face embeddings updated for all indexed images.",
+      );
+      await loadPeople();
+      await runSearch();
+    } catch (e) {
+      setNotice(`Face embedding update failed: ${String(e)}`);
+    } finally {
+      setLoading(false);
+      setScanProgress(null);
     }
   }
   async function deleteIndex() {
@@ -864,6 +968,28 @@ function App() {
     await loadPeople();
     await runSearch();
   }
+  async function deletePerson(id: number, displayName: string) {
+    if (
+      !window.confirm(
+        `Remove "${displayName}" from people? Tagged faces will become unnamed; face regions are kept.`,
+      )
+    ) {
+      return;
+    }
+    try {
+      await invoke("delete_person", { personId: id });
+      setRename((r) => {
+        const next = { ...r };
+        delete next[id];
+        return next;
+      });
+      await loadPeople();
+      await runSearch();
+      setNotice(`Removed "${displayName}" from people.`);
+    } catch (e) {
+      setNotice(`Failed to remove person: ${String(e)}`);
+    }
+  }
   async function sidecar(cmd: "generate_embeddings") {
     setLoading(true);
     const imageMaxWidth = num(embeddingImageMaxWidth);
@@ -910,6 +1036,21 @@ function App() {
       setFaceBusy(false);
     }
   }
+  async function applyFaceListForMedia(mediaId: number, requestId: number) {
+    const f = await invoke<Face[]>("list_faces", {
+      mediaItemId: mediaId,
+      personId: null,
+    });
+    if (requestId !== faceRequestRef.current) return;
+    setFaces(f.filter((x) => x.media_item_id === mediaId));
+    setFaceNames(
+      Object.fromEntries(
+        f
+          .filter((x) => x.media_item_id === mediaId)
+          .map((x) => [x.id, x.person_name || ""]),
+      ),
+    );
+  }
   async function processFaceImage(mediaId: number) {
     const requestId = ++faceRequestRef.current;
     setFaces([]);
@@ -918,19 +1059,7 @@ function App() {
     setFaceBusy(true);
     try {
       await invoke<SidecarResult>("process_face_setup_image", { mediaId });
-      const f = await invoke<Face[]>("list_faces", {
-        mediaItemId: mediaId,
-        personId: null,
-      });
-      if (requestId !== faceRequestRef.current) return;
-      setFaces(f.filter((x) => x.media_item_id === mediaId));
-      setFaceNames(
-        Object.fromEntries(
-          f
-            .filter((x) => x.media_item_id === mediaId)
-            .map((x) => [x.id, x.person_name || ""]),
-        ),
-      );
+      await applyFaceListForMedia(mediaId, requestId);
       await loadPeople();
     } catch (e) {
       if (requestId === faceRequestRef.current) {
@@ -951,23 +1080,28 @@ function App() {
   async function saveFaceName(faceId: number) {
     const name = (faceNames[faceId] || "").trim();
     if (!name) return;
+    const requestId = ++faceRequestRef.current;
     setFaceBusy(true);
     try {
       const matched = await invoke<number>("name_face", { faceId, name });
-      setNotice(`Named face and matched ${matched} similar unnamed face(s).`);
+      setNotice(
+        `Named face and matched ${matched} similar unnamed face(s) in other photos.`,
+      );
       const item = faceItems[faceIndex];
-      if (item) await processFaceImage(item.id);
+      if (item) await applyFaceListForMedia(item.id, requestId);
       await loadPeople();
     } catch (e) {
       setNotice(`Naming face failed: ${String(e)}`);
     } finally {
-      setFaceBusy(false);
+      if (requestId === faceRequestRef.current) setFaceBusy(false);
     }
   }
   const currentFaceItem = faceItems[faceIndex];
   const visibleFaces = currentFaceItem
     ? faces.filter((f) => f.media_item_id === currentFaceItem.id)
     : [];
+  const unnamedFacesHere = visibleFaces.filter((f) => f.person_id == null);
+  const namedFacesHere = visibleFaces.filter((f) => f.person_id != null);
 
   return (
     <main className="app-shell flex h-dvh min-h-0 flex-col">
@@ -1145,21 +1279,41 @@ function App() {
                   : "DB · not connected"}
               </p>
             </div>
-            <div className="glass-panel shrink-0 rounded-lg p-1 flex items-center">
-              <button
-                type="button"
-                onClick={() => setView("grid")}
-                className={`flex items-center gap-2 rounded-md px-4 py-2.5 text-[15px] font-bold ${view === "grid" ? "primary-btn" : "text-slate-200"}`}
-              >
-                <span className="text-lg">{icons.grid}</span> Grid
-              </button>
-              <button
-                type="button"
-                onClick={() => setView("list")}
-                className={`flex items-center gap-2 rounded-md px-4 py-2.5 text-[15px] font-bold ${view === "list" ? "primary-btn" : "text-slate-200"}`}
-              >
-                <span className="text-lg">{icons.list}</span> List
-              </button>
+            <div className="flex shrink-0 flex-wrap items-center gap-2">
+              <div className="glass-panel rounded-lg p-1 flex items-center">
+                <button
+                  type="button"
+                  onClick={() => changeSortOrder("desc")}
+                  className={`rounded-md px-4 py-2.5 text-[15px] font-bold ${sortOrder === "desc" ? "primary-btn" : "text-slate-200"}`}
+                  title="Newest first"
+                >
+                  Newest
+                </button>
+                <button
+                  type="button"
+                  onClick={() => changeSortOrder("asc")}
+                  className={`rounded-md px-4 py-2.5 text-[15px] font-bold ${sortOrder === "asc" ? "primary-btn" : "text-slate-200"}`}
+                  title="Oldest first"
+                >
+                  Oldest
+                </button>
+              </div>
+              <div className="glass-panel rounded-lg p-1 flex items-center">
+                <button
+                  type="button"
+                  onClick={() => setView("grid")}
+                  className={`flex items-center gap-2 rounded-md px-4 py-2.5 text-[15px] font-bold ${view === "grid" ? "primary-btn" : "text-slate-200"}`}
+                >
+                  <span className="text-lg">{icons.grid}</span> Grid
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setView("list")}
+                  className={`flex items-center gap-2 rounded-md px-4 py-2.5 text-[15px] font-bold ${view === "list" ? "primary-btn" : "text-slate-200"}`}
+                >
+                  <span className="text-lg">{icons.list}</span> List
+                </button>
+              </div>
             </div>
           </header>
           <div className="mb-5 grid shrink-0 grid-cols-2 gap-3 lg:grid-cols-4">
@@ -1183,7 +1337,10 @@ function App() {
               <div className="mb-2 flex justify-between gap-3">
                 <span>{scanProgress.phase}</span>
                 <span>
-                  {scanProgress.total_files
+                  {(scanProgress.total_files != null &&
+                    scanProgress.total_files > 0) ||
+                  (scanProgress.faces_total != null &&
+                    scanProgress.faces_total > 0)
                     ? `${scanPercent(scanProgress).toFixed(1)}%`
                     : `${scanProgress.discovered_files ?? 0} discovered`}
                 </span>
@@ -1197,12 +1354,28 @@ function App() {
                   {scanProgress.skipped_files} skipped · {scanProgress.errors}{" "}
                   errors
                 </span>
+                {(scanProgress.faces_total ?? 0) > 0 && (
+                  <span className="sm:col-span-2">
+                    Faces {scanProgress.faces_done ?? 0} /{" "}
+                    {scanProgress.faces_total}
+                  </span>
+                )}
               </div>
               <div className="h-2 overflow-hidden rounded-full bg-slate-900">
                 <div
-                  className={`h-full rounded-full bg-blue-400 ${scanProgress.total_files ? "" : "w-1/3 animate-pulse"}`}
+                  className={`h-full rounded-full bg-blue-400 ${
+                    (scanProgress.total_files != null &&
+                      scanProgress.total_files > 0) ||
+                    (scanProgress.faces_total != null &&
+                      scanProgress.faces_total > 0)
+                      ? ""
+                      : "w-1/3 animate-pulse"
+                  }`}
                   style={
-                    scanProgress.total_files
+                    (scanProgress.total_files != null &&
+                      scanProgress.total_files > 0) ||
+                    (scanProgress.faces_total != null &&
+                      scanProgress.faces_total > 0)
                       ? { width: `${scanPercent(scanProgress)}%` }
                       : undefined
                   }
@@ -1240,41 +1413,64 @@ function App() {
                 </p>
               </div>
             ) : (
-              <>
-                <div
-                  className={
-                    view === "grid"
-                      ? "grid grid-cols-2 gap-3 pb-4 sm:gap-4 lg:grid-cols-3 xl:grid-cols-4"
-                      : "space-y-3 pb-4"
-                  }
-                >
-                {items.map((item) => (
-                    <button
-                      key={item.id}
-                      onClick={() => openItem(item)}
-                      className={`media-card glass-panel overflow-hidden rounded-xl text-left hover:border-blue-400/70 ${view === "list" ? "flex w-full items-center gap-4 p-3" : ""}`}
+              <div className="space-y-7 pb-4">
+                {groupedItems.map((group) => (
+                  <section key={group.key}>
+                    <div className="mb-3 flex items-center gap-3">
+                      <h2 className="text-sm font-black uppercase tracking-[0.22em] text-slate-300">
+                        {group.label}
+                      </h2>
+                      <span className="h-px flex-1 bg-white/10" />
+                      <span className="text-xs font-semibold text-slate-500">
+                        {group.items.length}
+                      </span>
+                    </div>
+                    <div
+                      className={
+                        view === "grid"
+                          ? "grid grid-cols-2 gap-3 sm:gap-4 lg:grid-cols-3 xl:grid-cols-4"
+                          : "space-y-3"
+                      }
                     >
-                      <LazyMediaThumb item={item} view={view} />
-                      <div className="min-w-0 p-3">
-                        <p className="truncate font-semibold">
-                          {item.file_name}
-                        </p>
-                        <p className="text-xs text-slate-400">
-                          {item.media_type} · {formatBytes(item.size_bytes)} ·{" "}
-                          {formatDate(item.captured_at || item.modified_at)}
-                        </p>
-                        <p className="truncate text-xs text-slate-500">
-                          {item.camera_model ||
-                            item.lens_model ||
-                            (item.latitude != null
-                              ? "GPS tagged"
-                              : "No metadata")}
-                        </p>
-                      </div>
-                    </button>
-                  ))}
-                </div>
-              </>
+                      {group.items.map((item) => (
+                        <button
+                          key={item.id}
+                          onClick={() => openItem(item)}
+                          className={`media-card glass-panel overflow-hidden rounded-xl text-left hover:border-blue-400/70 ${view === "list" ? "flex w-full items-center gap-4 p-3" : ""}`}
+                        >
+                          <LazyMediaThumb item={item} view={view} />
+                          <div className="min-w-0 p-3">
+                            <p className="truncate font-semibold">
+                              {item.file_name}
+                            </p>
+                            <p className="text-xs text-slate-400">
+                              {item.media_type} ·{" "}
+                              {formatBytes(item.size_bytes)} ·{" "}
+                              {formatDate(
+                                item.captured_at ||
+                                  item.modified_at ||
+                                  item.created_at,
+                              )}
+                            </p>
+                            <p className="truncate text-xs text-slate-500">
+                              {item.camera_model ||
+                                item.lens_model ||
+                                (item.latitude != null
+                                  ? "GPS tagged"
+                                  : "No metadata")}
+                            </p>
+                          </div>
+                        </button>
+                      ))}
+                    </div>
+                  </section>
+                ))}
+                {hasMoreItems && (
+                  <div className="py-4 text-center text-xs font-semibold uppercase tracking-[0.2em] text-slate-500">
+                    More media loads as you scroll
+                  </div>
+                )}
+              </div>
             )}
           </div>
         </section>
@@ -1374,13 +1570,16 @@ function App() {
                       <h3 className="text-lg font-bold">People Recognition</h3>
                     </div>
                     <p className="text-sm text-slate-400 mb-5 leading-relaxed">
-                      Name the faces found in your media. Changes reflect
-                      immediately in search.
+                      After each library scan, faces are detected in the
+                      background (see progress). Use guided setup to name
+                      people, or refresh detections when you add more images.
                     </p>
 
                     {people.length === 0 ? (
                       <div className="rounded-xl border border-dashed border-white/10 p-6 text-center text-sm text-slate-500">
-                        No people found yet. Run "Cluster Faces" first.
+                        No people found yet. Run a library scan (faces are
+                        indexed automatically), then name people here or use
+                        Guided Face Setup.
                       </div>
                     ) : (
                       <div className="grid gap-3 sm:grid-cols-2">
@@ -1403,6 +1602,17 @@ function App() {
                               }
                               placeholder="Unnamed person"
                             />
+                            <button
+                              type="button"
+                              title="Remove person"
+                              aria-label={`Remove ${p.name} from people`}
+                              className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg border border-red-500/35 bg-red-950/40 text-lg font-bold leading-none text-red-300 transition-colors hover:border-red-400/60 hover:bg-red-950/70 hover:text-red-200"
+                              onClick={() =>
+                                deletePerson(p.id, rename[p.id] ?? p.name)
+                              }
+                            >
+                              −
+                            </button>
                             <button
                               className="h-9 rounded-lg bg-white/10 px-3 text-xs font-bold text-white transition-colors hover:bg-white/20"
                               onClick={() => renamePerson(p.id)}
@@ -1512,6 +1722,14 @@ function App() {
                         >
                           Guided Face Setup
                         </button>
+                        <button
+                          type="button"
+                          disabled={loading}
+                          onClick={updateFaceEmbeddings}
+                          className="flex w-full items-center justify-center gap-2 rounded-xl border border-emerald-500/30 bg-emerald-950/40 px-4 py-3.5 text-[14px] font-bold text-emerald-100 transition-colors hover:bg-emerald-900/50 disabled:opacity-50"
+                        >
+                          Update face embeddings
+                        </button>
                       </div>
                     </div>
                   </section>
@@ -1526,17 +1744,37 @@ function App() {
                   <div className="mb-2 flex justify-between gap-3">
                     <span>{scanProgress.phase}</span>
                     <span>
-                      {scanProgress.total_files
+                      {(scanProgress.total_files != null &&
+                        scanProgress.total_files > 0) ||
+                      (scanProgress.faces_total != null &&
+                        scanProgress.faces_total > 0)
                         ? `${scanPercent(scanProgress).toFixed(1)}%`
                         : `${scanProgress.discovered_files ?? 0} discovered`}{" "}
                       · {scanProgress.scanned_files} indexed
+                      {(scanProgress.faces_total ?? 0) > 0 && (
+                        <>
+                          {" "}
+                          · faces {scanProgress.faces_done ?? 0}/
+                          {scanProgress.faces_total}
+                        </>
+                      )}
                     </span>
                   </div>
                   <div className="h-2 overflow-hidden rounded-full bg-slate-900">
                     <div
-                      className={`h-full rounded-full bg-blue-400 ${scanProgress.total_files ? "" : "w-1/3 animate-pulse"}`}
+                      className={`h-full rounded-full bg-blue-400 ${
+                        (scanProgress.total_files != null &&
+                          scanProgress.total_files > 0) ||
+                        (scanProgress.faces_total != null &&
+                          scanProgress.faces_total > 0)
+                          ? ""
+                          : "w-1/3 animate-pulse"
+                      }`}
                       style={
-                        scanProgress.total_files
+                        (scanProgress.total_files != null &&
+                          scanProgress.total_files > 0) ||
+                        (scanProgress.faces_total != null &&
+                          scanProgress.faces_total > 0)
                           ? { width: `${scanPercent(scanProgress)}%` }
                           : undefined
                       }
@@ -1716,8 +1954,9 @@ function App() {
                   Sequential face recognition
                 </h2>
                 <p className="text-sm text-slate-400">
-                  Processes only the image you are viewing. Name a face and
-                  matching known faces appear in subsequent images.
+                  Processes only the image you are viewing. Name each face
+                  individually; similar unnamed faces in other photos may be
+                  labeled automatically when similarity is high enough.
                 </p>
               </div>
               <button
@@ -1764,7 +2003,7 @@ function App() {
                         className="block max-h-full max-w-full rounded-xl object-contain"
                       />
                       {faceImageSize &&
-                        visibleFaces.map((f, index) => {
+                        visibleFaces.map((f) => {
                           const left = Math.max(
                             0,
                             Math.min(100, (f.x / faceImageSize.width) * 100),
@@ -1787,10 +2026,18 @@ function App() {
                               (f.height / faceImageSize.height) * 100,
                             ),
                           );
+                          const named = f.person_id != null;
+                          const unnamedIdx = named
+                            ? -1
+                            : unnamedFacesHere.findIndex((u) => u.id === f.id);
                           return (
                             <div
                               key={f.id}
-                              className="pointer-events-none absolute rounded-md border-2 border-blue-300 shadow-[0_0_0_1px_rgba(15,23,42,0.9),0_0_24px_rgba(96,165,250,0.45)]"
+                              className={`pointer-events-none absolute rounded-md border-2 shadow-[0_0_0_1px_rgba(15,23,42,0.9)] ${
+                                named
+                                  ? "border-emerald-400 shadow-[0_0_24px_rgba(52,211,153,0.35)]"
+                                  : "border-blue-300 shadow-[0_0_24px_rgba(96,165,250,0.45)]"
+                              }`}
                               style={{
                                 left: `${left}%`,
                                 top: `${top}%`,
@@ -1798,8 +2045,16 @@ function App() {
                                 height: `${height}%`,
                               }}
                             >
-                              <span className="absolute -left-2 -top-3 flex h-7 min-w-7 items-center justify-center rounded-full border border-slate-950 bg-blue-400 px-2 text-xs font-black text-slate-950 shadow-lg">
-                                {index + 1}
+                              <span
+                                className={`absolute -left-2 -top-3 flex h-7 min-w-7 items-center justify-center rounded-full border border-slate-950 px-2 text-xs font-black text-slate-950 shadow-lg ${
+                                  named ? "bg-emerald-400" : "bg-blue-400"
+                                }`}
+                              >
+                                {named
+                                  ? (f.person_name || "?").slice(0, 3)
+                                  : unnamedIdx >= 0
+                                    ? unnamedIdx + 1
+                                    : "?"}
                               </span>
                             </div>
                           );
@@ -1820,45 +2075,84 @@ function App() {
                     No faces detected here. Move to the next image.
                   </p>
                 )}
-                <div className="space-y-3">
-                  {visibleFaces.map((f, index) => (
-                    <div key={f.id} className="rounded-xl bg-slate-900/60 p-3">
-                      <div className="mb-2 flex items-center justify-between text-xs text-slate-400">
-                        <span className="flex items-center gap-2">
-                          <span className="flex h-6 min-w-6 items-center justify-center rounded-full bg-blue-400 px-1.5 text-[11px] font-black text-slate-950">
-                            {index + 1}
+                {!faceBusy &&
+                  visibleFaces.length > 0 &&
+                  unnamedFacesHere.length === 0 && (
+                    <p className="mb-4 rounded-xl border border-emerald-500/25 bg-emerald-950/20 p-4 text-sm text-emerald-200/90">
+                      All detected faces in this photo are named. Use the
+                      preview boxes to see who is where.
+                    </p>
+                  )}
+                {namedFacesHere.length > 0 && (
+                  <div className="mb-4 rounded-xl border border-emerald-500/20 bg-slate-900/40 p-3">
+                    <p className="mb-2 text-xs font-bold uppercase tracking-wide text-emerald-300/90">
+                      Named ({namedFacesHere.length})
+                    </p>
+                    <ul className="space-y-1.5 text-sm text-slate-300">
+                      {namedFacesHere.map((f) => (
+                        <li key={f.id} className="flex justify-between gap-2">
+                          <span className="truncate text-slate-400">
+                            Face #{f.id}
                           </span>
-                          Face #{f.id}
-                        </span>
-                        <span>{f.person_name || "Unknown"}</span>
-                      </div>
-                      <div className="flex gap-2">
-                        <input
-                          className="field h-10 flex-1"
-                          value={faceNames[f.id] ?? ""}
-                          onChange={(e) =>
-                            setFaceNames((n) => ({
-                              ...n,
-                              [f.id]: e.target.value,
-                            }))
-                          }
-                          placeholder="Name this person"
-                        />
-                        <button
-                          onClick={() => saveFaceName(f.id)}
-                          disabled={faceBusy || !(faceNames[f.id] || "").trim()}
-                          className="primary-btn px-4 disabled:opacity-40"
+                          <span className="shrink-0 font-semibold text-emerald-200">
+                            {f.person_name}
+                          </span>
+                        </li>
+                      ))}
+                    </ul>
+                  </div>
+                )}
+                {visibleFaces.length > 0 && (
+                  <>
+                    <p className="mb-2 text-xs font-bold uppercase tracking-wide text-slate-500">
+                      Needs a name ({unnamedFacesHere.length})
+                    </p>
+                    <div className="space-y-3">
+                      {unnamedFacesHere.map((f, index) => (
+                        <div
+                          key={f.id}
+                          className="rounded-xl bg-slate-900/60 p-3"
                         >
-                          Save
-                        </button>
-                      </div>
-                      <p className="mt-2 text-xs text-slate-500">
-                        Box: {Math.round(f.x)}, {Math.round(f.y)} ·{" "}
-                        {Math.round(f.width)}×{Math.round(f.height)}
-                      </p>
+                          <div className="mb-2 flex items-center justify-between text-xs text-slate-400">
+                            <span className="flex items-center gap-2">
+                              <span className="flex h-6 min-w-6 items-center justify-center rounded-full bg-blue-400 px-1.5 text-[11px] font-black text-slate-950">
+                                {index + 1}
+                              </span>
+                              Face #{f.id}
+                            </span>
+                            <span>Unnamed</span>
+                          </div>
+                          <div className="flex gap-2">
+                            <input
+                              className="field h-10 flex-1"
+                              value={faceNames[f.id] ?? ""}
+                              onChange={(e) =>
+                                setFaceNames((n) => ({
+                                  ...n,
+                                  [f.id]: e.target.value,
+                                }))
+                              }
+                              placeholder="Name this person"
+                            />
+                            <button
+                              onClick={() => saveFaceName(f.id)}
+                              disabled={
+                                faceBusy || !(faceNames[f.id] || "").trim()
+                              }
+                              className="primary-btn px-4 disabled:opacity-40"
+                            >
+                              Save
+                            </button>
+                          </div>
+                          <p className="mt-2 text-xs text-slate-500">
+                            Box: {Math.round(f.x)}, {Math.round(f.y)} ·{" "}
+                            {Math.round(f.width)}×{Math.round(f.height)}
+                          </p>
+                        </div>
+                      ))}
                     </div>
-                  ))}
-                </div>
+                  </>
+                )}
               </aside>
             </div>
           </div>

@@ -9,7 +9,9 @@ from typing import Any
 
 import numpy as np
 
-from .clustering import LocalFaceClusterer, cosine
+from .clustering import cosine
+from .insightface_engine import cluster_paths as insightface_cluster_paths
+from .insightface_engine import handle_face_match_request
 from .providers import GOOGLE_EMBEDDING_MODELS, OLLAMA_EMBEDDING_MODELS, OPENROUTER_EMBEDDING_MODELS, RemoteProviderUnavailableError, create_provider, embed_paths, embed_texts
 
 
@@ -46,12 +48,25 @@ def build_parser() -> argparse.ArgumentParser:
 
     cf = sub.add_parser("cluster-faces", help="Detect faces in images and cluster them")
     cf.add_argument("paths", nargs="*", type=Path)
-    cf.add_argument("--threshold", type=float, default=0.88)
+    cf.add_argument("--threshold", type=float, default=0.42)
     cf.add_argument("--json", dest="json_payload", help="JSON request: {paths:[], threshold?:number}")
+
+    sf = sub.add_parser("serve-faces", help="Read cluster-faces JSON requests from stdin")
+    sf.add_argument("--threshold", type=float, default=0.42)
 
     old = sub.add_parser("cluster", help="Alias for cluster-faces")
     old.add_argument("paths", nargs="*", type=Path)
-    old.add_argument("--threshold", type=float, default=0.88)
+    old.add_argument("--threshold", type=float, default=0.42)
+
+    fm = sub.add_parser(
+        "face-match",
+        help="FAISS-backed similarity: read JSON request from stdin (propagate / best_person)",
+    )
+    fm.add_argument(
+        "--stdin",
+        action="store_true",
+        help="Read one JSON object from stdin (avoids huge argv on Windows)",
+    )
 
     m = sub.add_parser("embedding-models", help="List common embedding models by provider")
 
@@ -84,6 +99,21 @@ def _load_vectors(value: str) -> list[dict]:
         return json.loads(value)
 
 
+def serve_faces(default_threshold: float) -> int:
+    """Process newline-delimited face clustering requests with a warm model."""
+    for line in sys.stdin:
+        try:
+            payload = json.loads(line) if line.strip() else {}
+            paths = [Path(p) for p in payload.get("paths", [])]
+            threshold = float(payload.get("threshold", default_threshold))
+            response = {"ok": True, "data": _jsonable(insightface_cluster_paths(paths, threshold))}
+            print(json.dumps(response, sort_keys=True, separators=(",", ":")), flush=True)
+        except Exception as exc:
+            response = {"ok": False, "error": {"code": "error", "message": str(exc)}}
+            print(json.dumps(response, sort_keys=True, separators=(",", ":")), flush=True)
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
@@ -101,7 +131,16 @@ def main(argv: list[str] | None = None) -> int:
             payload = _payload(getattr(args, "json_payload", None))
             paths = [Path(p) for p in payload.get("paths", [])] + list(args.paths)
             threshold = float(payload.get("threshold", args.threshold))
-            write_ok(LocalFaceClusterer(threshold=threshold).cluster_paths(paths))
+            write_ok(insightface_cluster_paths(paths, threshold))
+            return 0
+        if args.command == "serve-faces":
+            return serve_faces(float(args.threshold))
+        if args.command == "face-match":
+            if not getattr(args, "stdin", False):
+                raise ValueError("face-match requires --stdin")
+            body = sys.stdin.read()
+            req = json.loads(body) if body.strip() else {}
+            write_ok(handle_face_match_request(req))
             return 0
         if args.command == "embedding-models":
             write_ok({"models": {"ollama": OLLAMA_EMBEDDING_MODELS, "google": GOOGLE_EMBEDDING_MODELS, "openrouter": OPENROUTER_EMBEDDING_MODELS}})

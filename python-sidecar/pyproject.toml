@@ -10,7 +10,15 @@ readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "UNLICENSED" }
 authors = [{ name = "Rich Media Viewer contributors" }]
-dependencies = ["numpy>=1.24", "Pillow>=10.0", "opencv-python-headless>=4.8"]
+dependencies = [
+    "numpy>=1.24",
+    "Pillow>=10.0",
+    "opencv-python-headless>=4.8",
+    "insightface>=0.7.3",
+    "onnxruntime-gpu[cuda,cudnn]>=1.21.0; platform_system == 'Windows' or platform_system == 'Linux'",
+    "onnxruntime>=1.21.0; platform_system != 'Windows' and platform_system != 'Linux'",
+    "faiss-cpu>=1.7.4",
+]
 
 [project.scripts]
 rich-media-sidecar = "rich_media_sidecar.__main__:main"
