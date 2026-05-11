@@ -198,6 +198,11 @@ struct SemanticHit {
     item: MediaItem,
     score: f64,
 }
+#[derive(Debug, Serialize)]
+struct GeoPoint {
+    latitude: f64,
+    longitude: f64,
+}
 
 fn app_data_dir(_app: &tauri::AppHandle) -> Result<PathBuf, String> {
     #[cfg(debug_assertions)]
@@ -408,6 +413,28 @@ fn row_to_media(row: &rusqlite::Row<'_>) -> rusqlite::Result<MediaItem> {
         longitude: row.get(15)?,
         metadata_json: row.get(16)?,
     })
+}
+fn haversine_km(lat1: f64, lng1: f64, lat2: f64, lng2: f64) -> f64 {
+    let earth_radius_km = 6371.0088_f64;
+    let dlat = (lat2 - lat1).to_radians();
+    let dlng = (lng2 - lng1).to_radians();
+    let lat1 = lat1.to_radians();
+    let lat2 = lat2.to_radians();
+    let a = (dlat / 2.0).sin().powi(2) + lat1.cos() * lat2.cos() * (dlng / 2.0).sin().powi(2);
+    2.0 * earth_radius_km * a.sqrt().asin()
+}
+fn radius_bounds(lat: f64, lng: f64, radius_km: f64) -> (f64, f64, Option<(f64, f64)>) {
+    let lat_delta = radius_km / 111.32;
+    let min_lat = (lat - lat_delta).max(-90.0);
+    let max_lat = (lat + lat_delta).min(90.0);
+    let lng_bounds = if min_lat <= -90.0 || max_lat >= 90.0 {
+        None
+    } else {
+        let cos_lat = lat.to_radians().cos().abs().max(0.01);
+        let lng_delta = (radius_km / (111.32 * cos_lat)).min(180.0);
+        Some(((lng - lng_delta).max(-180.0), (lng + lng_delta).min(180.0)))
+    };
+    (min_lat, max_lat, lng_bounds)
 }
 #[tauri::command]
 fn initialize_app(app: tauri::AppHandle) -> Result<AppInfo, String> {
@@ -885,6 +912,17 @@ fn search_media(app: tauri::AppHandle, filter: SearchFilter) -> Result<Vec<Media
     let mut sql = format!("{MEDIA_SELECT} WHERE 1=1");
     sql.push_str(&sql_path_not_blacklisted_clause());
     let mut v: Vec<Box<dyn ToSql>> = vec![];
+    let radius_filter = match (filter.lat, filter.lng, filter.radius_km) {
+        (Some(lat), Some(lng), Some(radius_km))
+            if (-90.0..=90.0).contains(&lat)
+                && (-180.0..=180.0).contains(&lng)
+                && radius_km.is_finite()
+                && radius_km > 0.0 =>
+        {
+            Some((lat, lng, radius_km))
+        }
+        _ => None,
+    };
     if filter.person_id.is_some() || filter.person_name.is_some() {
         sql.push_str(" AND EXISTS(SELECT 1 FROM faces f LEFT JOIN people p ON p.id=f.person_id WHERE f.media_item_id=media_items.id");
         if let Some(id) = filter.person_id {
@@ -939,31 +977,69 @@ fn search_media(app: tauri::AppHandle, filter: SearchFilter) -> Result<Vec<Media
             " AND camera_make IS NULL AND camera_model IS NULL"
         });
     }
-    if let (Some(lat), Some(lng), Some(r)) = (filter.lat, filter.lng, filter.radius_km) {
-        sql.push_str(" AND latitude IS NOT NULL AND longitude IS NOT NULL AND (111.045*sqrt((latitude-?)*(latitude-?) + ((longitude-?)*cos(?*0.0174532925199433))*((longitude-?)*cos(?*0.0174532925199433)))) <= ?");
-        v.extend([
-            Box::new(lat) as Box<dyn ToSql>,
-            Box::new(lat),
-            Box::new(lng),
-            Box::new(lat),
-            Box::new(lng),
-            Box::new(lat),
-            Box::new(r),
-        ]);
+    if let Some((lat, lng, radius_km)) = radius_filter {
+        let (min_lat, max_lat, lng_bounds) = radius_bounds(lat, lng, radius_km);
+        sql.push_str(
+            " AND latitude IS NOT NULL AND longitude IS NOT NULL AND latitude>=? AND latitude<=?",
+        );
+        v.push(Box::new(min_lat));
+        v.push(Box::new(max_lat));
+        if let Some((min_lng, max_lng)) = lng_bounds {
+            sql.push_str(" AND longitude>=? AND longitude<=?");
+            v.push(Box::new(min_lng));
+            v.push(Box::new(max_lng));
+        }
     }
-    sql.push_str(
-        " ORDER BY COALESCE(captured_at,modified_at,created_at) DESC,id DESC LIMIT ? OFFSET ?",
-    );
-    v.push(Box::new(filter.limit.unwrap_or(100).clamp(1, 500)));
-    v.push(Box::new(filter.offset.unwrap_or(0).max(0)));
+    sql.push_str(" ORDER BY COALESCE(captured_at,modified_at,created_at) DESC,id DESC");
+    if radius_filter.is_none() {
+        sql.push_str(" LIMIT ? OFFSET ?");
+        v.push(Box::new(filter.limit.unwrap_or(100).clamp(1, 500)));
+        v.push(Box::new(filter.offset.unwrap_or(0).max(0)));
+    }
     let refs: Vec<&dyn ToSql> = v.iter().map(|x| x.as_ref()).collect();
     let mut st = c.prepare(&sql).map_err(|e| e.to_string())?;
-    let res = st
+    let mut res = st
         .query_map(params_from_iter(refs), row_to_media)
         .map_err(|e| e.to_string())?
         .collect::<Result<Vec<_>, _>>()
-        .map_err(|e| e.to_string());
-    res
+        .map_err(|e| e.to_string())?;
+    if let Some((lat, lng, radius_km)) = radius_filter {
+        let offset = filter.offset.unwrap_or(0).max(0) as usize;
+        let limit = filter.limit.unwrap_or(100).clamp(1, 500) as usize;
+        res = res
+            .into_iter()
+            .filter(|item| {
+                item.latitude
+                    .zip(item.longitude)
+                    .is_some_and(|(item_lat, item_lng)| {
+                        haversine_km(lat, lng, item_lat, item_lng) <= radius_km
+                    })
+            })
+            .skip(offset)
+            .take(limit)
+            .collect();
+    }
+    Ok(res)
+}
+#[tauri::command]
+fn list_geo_points(app: tauri::AppHandle) -> Result<Vec<GeoPoint>, String> {
+    let c = open_db(&app)?;
+    let mut s = c
+        .prepare(
+            "SELECT latitude,longitude FROM media_items WHERE media_type='image' AND missing=0 AND latitude IS NOT NULL AND longitude IS NOT NULL",
+        )
+        .map_err(|e| e.to_string())?;
+    let points = s
+        .query_map([], |r| {
+            Ok(GeoPoint {
+                latitude: r.get(0)?,
+                longitude: r.get(1)?,
+            })
+        })
+        .map_err(|e| e.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())?;
+    Ok(points)
 }
 #[tauri::command]
 fn list_people(app: tauri::AppHandle) -> Result<Vec<Person>, String> {
@@ -1502,7 +1578,8 @@ pub fn run() {
             process_face_setup_image,
             generate_embeddings,
             search_semantic,
-            search_semantic_text
+            search_semantic_text,
+            list_geo_points
         ])
         .run(tauri::generate_context!())
         .expect("error while running Tauri application");

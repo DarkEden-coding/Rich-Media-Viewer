@@ -1,5 +1,7 @@
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import L from "leaflet";
+import "leaflet/dist/leaflet.css";
 import {
   memo,
   startTransition,
@@ -71,6 +73,10 @@ type Face = {
   height: number;
   confidence: number | null;
   created_at: number;
+};
+type GeoPoint = {
+  latitude: number;
+  longitude: number;
 };
 type ViewMode = "grid" | "list";
 
@@ -259,6 +265,23 @@ const icons = {
       <path d="M3 5h4" />
     </svg>
   ),
+  map: (
+    <svg
+      xmlns="http://www.w3.org/2000/svg"
+      width="1em"
+      height="1em"
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+    >
+      <path d="M14.1 4.8 9.9 3.2a2 2 0 0 0-1.5.1L4 5.2a2 2 0 0 0-1.2 1.9v11.2a1 1 0 0 0 1.4.9l4.7-2 5.2 2 5.5-2.4a2 2 0 0 0 1.2-1.8V3.8a1 1 0 0 0-1.4-.9l-5.3 2Z" />
+      <path d="M9 3v14" />
+      <path d="M15 5v14" />
+    </svg>
+  ),
 };
 const providers = ["ollama", "google", "openrouter"];
 const ollamaEmbeddingModels = [
@@ -341,6 +364,116 @@ function scanPercent(p: ScanProgress) {
     ? Math.min(100, Math.max(0, (completed / p.total_files) * 100))
     : 0;
 }
+function formatCoord(value: string, fallback = "Not set") {
+  const n = Number(value);
+  return value.trim() === "" || Number.isNaN(n) ? fallback : n.toFixed(4);
+}
+
+function EarthRegionMap({
+  points,
+  lat,
+  lng,
+  radius,
+  onPick,
+}: {
+  points: GeoPoint[];
+  lat: string;
+  lng: string;
+  radius: string;
+  onPick: (lat: number, lng: number) => void;
+}) {
+  const mapEl = useRef<HTMLDivElement | null>(null);
+  const mapRef = useRef<L.Map | null>(null);
+  const pinLayerRef = useRef<L.LayerGroup | null>(null);
+  const selectionLayerRef = useRef<L.LayerGroup | null>(null);
+  const centerLat = num(lat);
+  const centerLng = num(lng);
+  const radiusKm = num(radius);
+  useEffect(() => {
+    if (!mapEl.current || mapRef.current) return;
+    const initialCenter: L.LatLngExpression =
+      centerLat != null && centerLng != null
+        ? [centerLat, centerLng]
+        : points[0]
+          ? [points[0].latitude, points[0].longitude]
+          : [20, 0];
+    const map = L.map(mapEl.current, {
+      center: initialCenter,
+      zoom: centerLat != null && centerLng != null ? 10 : points.length ? 3 : 2,
+      worldCopyJump: true,
+      zoomControl: true,
+    });
+    L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png", {
+      maxZoom: 19,
+      attribution:
+        '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors',
+    }).addTo(map);
+    pinLayerRef.current = L.layerGroup().addTo(map);
+    selectionLayerRef.current = L.layerGroup().addTo(map);
+    map.on("click", (event: L.LeafletMouseEvent) => {
+      onPick(event.latlng.lat, event.latlng.lng);
+    });
+    mapRef.current = map;
+    setTimeout(() => map.invalidateSize(), 0);
+    return () => {
+      map.remove();
+      mapRef.current = null;
+      pinLayerRef.current = null;
+      selectionLayerRef.current = null;
+    };
+    // The map click handler intentionally uses the initial onPick callback.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+  useEffect(() => {
+    const layer = pinLayerRef.current;
+    if (!layer) return;
+    layer.clearLayers();
+    points.slice(0, 2500).forEach((point) => {
+      L.circleMarker([point.latitude, point.longitude], {
+        radius: 4,
+        stroke: true,
+        color: "#0f172a",
+        weight: 1.2,
+        fillColor: "#facc15",
+        fillOpacity: 0.92,
+      }).addTo(layer);
+    });
+  }, [points]);
+  useEffect(() => {
+    const layer = selectionLayerRef.current;
+    if (!layer) return;
+    layer.clearLayers();
+    if (centerLat == null || centerLng == null) return;
+    const center: L.LatLngExpression = [centerLat, centerLng];
+    L.circle(center, {
+      radius: Math.max(1, radiusKm ?? 1) * 1000,
+      color: "#2563eb",
+      weight: 2,
+      fillColor: "#60a5fa",
+      fillOpacity: 0.16,
+    }).addTo(layer);
+    L.circleMarker(center, {
+      radius: 8,
+      color: "#dbeafe",
+      weight: 2,
+      fillColor: "#2563eb",
+      fillOpacity: 1,
+    }).addTo(layer);
+  }, [centerLat, centerLng, radiusKm]);
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!map || centerLat == null || centerLng == null) return;
+    map.panTo([centerLat, centerLng], { animate: true });
+  }, [centerLat, centerLng]);
+  return (
+    <div
+      ref={mapEl}
+      role="application"
+      aria-label="OpenStreetMap location picker"
+      className="region-map h-full min-h-[420px] w-full cursor-crosshair rounded-xl"
+    />
+  );
+}
 
 const LazyMediaThumb = memo(function LazyMediaThumb({
   item,
@@ -400,6 +533,13 @@ function App() {
     localStorage.getItem("rmv.embeddingImageMaxWidth") || "1024",
   );
   const [filters, setFilters] = useState(emptyFilters);
+  const [geoPoints, setGeoPoints] = useState<GeoPoint[]>([]);
+  const [regionOpen, setRegionOpen] = useState(false);
+  const [regionDraft, setRegionDraft] = useState({
+    lat: "",
+    lng: "",
+    radius: "50",
+  });
   const [people, setPeople] = useState<Person[]>([]);
   const [items, setItems] = useState<MediaItem[]>([]);
   const [hasMoreItems, setHasMoreItems] = useState(true);
@@ -457,6 +597,33 @@ function App() {
     } catch {
       /* no people yet */
     }
+  }
+  async function loadGeoPoints() {
+    try {
+      setGeoPoints(await invoke<GeoPoint[]>("list_geo_points"));
+    } catch {
+      setGeoPoints([]);
+    }
+  }
+  function openRegionModal() {
+    setRegionDraft({
+      lat: filters.lat,
+      lng: filters.lng,
+      radius: filters.radius || "50",
+    });
+    setRegionOpen(true);
+  }
+  function applyRegion() {
+    const next = {
+      ...filters,
+      lat: regionDraft.lat,
+      lng: regionDraft.lng,
+      radius: regionDraft.radius,
+      hasGps: regionDraft.lat && regionDraft.lng ? "true" : filters.hasGps,
+    };
+    setFilters(next);
+    setRegionOpen(false);
+    void runSearch(next);
   }
   function buildSearchFilter(next = filters, offset = 0) {
     return {
@@ -562,6 +729,7 @@ function App() {
         setIndexExists(info.index_exists);
         await loadSettings();
         await loadPeople();
+        await loadGeoPoints();
         await runSearch();
         setNotice("Library database ready");
       })
@@ -638,6 +806,7 @@ function App() {
         `Scan complete: ${summary.imported_or_updated} imported/updated`,
       );
       await runSearch();
+      await loadGeoPoints();
     } catch (e) {
       setNotice(`Scan failed: ${String(e)}`);
     } finally {
@@ -665,6 +834,7 @@ function App() {
       setSelected(null);
       setScan(null);
       setScanProgress(null);
+      setGeoPoints([]);
       setHasMoreItems(false);
       setNotice(
         "Index database deleted. Add folders and scan to rebuild it.",
@@ -863,27 +1033,25 @@ function App() {
                     />
                   </label>
                 </div>
-                <div className="mt-5 space-y-3">
-                  <div className="grid grid-cols-2 gap-3">
-                    <input
-                      value={filters.lat}
-                      onChange={(e) => updateFilter("lat", e.target.value)}
-                      placeholder="Latitude"
-                      className="field min-w-0"
-                    />
-                    <input
-                      value={filters.lng}
-                      onChange={(e) => updateFilter("lng", e.target.value)}
-                      placeholder="Longitude"
-                      className="field min-w-0"
-                    />
+                <div className="mt-5 rounded-lg border border-white/10 bg-slate-950/35 p-3">
+                  <div className="flex items-center justify-between gap-3">
+                    <div className="min-w-0">
+                      <span className="sub-label">Search region</span>
+                      <p className="truncate text-xs text-slate-400">
+                        {filters.lat && filters.lng
+                          ? `${formatCoord(filters.lat)}, ${formatCoord(filters.lng)} · ${filters.radius || "0"} km`
+                          : "No map region selected"}
+                      </p>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={openRegionModal}
+                      className="flex shrink-0 items-center gap-2 rounded-lg bg-white/10 px-3 py-2 text-sm font-bold text-slate-100 transition-colors hover:bg-white/15"
+                    >
+                      <span className="text-base">{icons.map}</span>
+                      Search region
+                    </button>
                   </div>
-                  <input
-                    value={filters.radius}
-                    onChange={(e) => updateFilter("radius", e.target.value)}
-                    placeholder="Radius (km)"
-                    className="field w-full max-w-full"
-                  />
                 </div>
                 <div className="mt-5 grid grid-cols-2 gap-4">
                   <select
@@ -951,15 +1119,6 @@ function App() {
                     <option value="false">No camera</option>
                   </select>
                 </div>
-                {filters.lat && filters.lng && (
-                  <a
-                    className="mt-3 block text-sm text-blue-300 underline"
-                    target="_blank"
-                    href={`https://www.openstreetmap.org/?mlat=${filters.lat}&mlon=${filters.lng}#map=11/${filters.lat}/${filters.lng}`}
-                  >
-                    Open radius center in OpenStreetMap
-                  </a>
-                )}
                 <button
                   onClick={() => runSearch()}
                   disabled={loading}
@@ -1422,6 +1581,120 @@ function App() {
                 </div>
               </div>
             </div>
+          </div>
+        </div>
+      )}
+      {regionOpen && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 p-4"
+          onClick={() => setRegionOpen(false)}
+        >
+          <div
+            onClick={(e) => e.stopPropagation()}
+            className="glass-panel grid max-h-[92vh] w-full max-w-5xl overflow-hidden rounded-2xl lg:grid-cols-[1fr_320px]"
+          >
+            <section className="min-h-0 p-4">
+              <EarthRegionMap
+                points={geoPoints}
+                lat={regionDraft.lat}
+                lng={regionDraft.lng}
+                radius={regionDraft.radius}
+                onPick={(lat, lng) =>
+                  setRegionDraft((draft) => ({
+                    ...draft,
+                    lat: lat.toFixed(5),
+                    lng: lng.toFixed(5),
+                  }))
+                }
+              />
+            </section>
+            <aside className="border-t border-white/10 bg-slate-950/40 p-5 lg:border-l lg:border-t-0">
+              <p className="text-xs font-black uppercase tracking-[0.28em] text-blue-300">
+                Map filter
+              </p>
+              <h2 className="mt-2 text-2xl font-black">Search region</h2>
+              <p className="mt-2 text-sm text-slate-400">
+                Zoom and pan the OpenStreetMap view, then click to place the
+                center. Indexed geolocated images appear as small pins only.
+              </p>
+              <div className="mt-6 grid grid-cols-2 gap-3">
+                <label>
+                  <span className="sub-label">Latitude</span>
+                  <input
+                    value={regionDraft.lat}
+                    onChange={(e) =>
+                      setRegionDraft((draft) => ({ ...draft, lat: e.target.value }))
+                    }
+                    className="field"
+                    placeholder="0.00000"
+                  />
+                </label>
+                <label>
+                  <span className="sub-label">Longitude</span>
+                  <input
+                    value={regionDraft.lng}
+                    onChange={(e) =>
+                      setRegionDraft((draft) => ({ ...draft, lng: e.target.value }))
+                    }
+                    className="field"
+                    placeholder="0.00000"
+                  />
+                </label>
+              </div>
+              <label className="mt-5 block">
+                <span className="sub-label">Radius kilometers</span>
+                <input
+                  type="range"
+                  min="1"
+                  max="2000"
+                  step="1"
+                  value={regionDraft.radius || "1"}
+                  onChange={(e) =>
+                    setRegionDraft((draft) => ({
+                      ...draft,
+                      radius: e.target.value,
+                    }))
+                  }
+                  className="mt-2 w-full"
+                />
+                <input
+                  value={regionDraft.radius}
+                  onChange={(e) =>
+                    setRegionDraft((draft) => ({
+                      ...draft,
+                      radius: e.target.value,
+                    }))
+                  }
+                  className="field mt-3"
+                  placeholder="50"
+                />
+              </label>
+              <div className="mt-5 rounded-lg border border-white/10 bg-slate-900/60 p-3 text-sm text-slate-300">
+                {geoPoints.length} indexed image pin
+                {geoPoints.length === 1 ? "" : "s"}
+              </div>
+              <div className="mt-6 flex justify-end gap-3">
+                <button
+                  type="button"
+                  onClick={() => setRegionOpen(false)}
+                  className="rounded-lg px-4 py-2.5 font-bold text-slate-300 hover:bg-white/10 hover:text-white"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="button"
+                  onClick={applyRegion}
+                  disabled={
+                    num(regionDraft.lat) == null ||
+                    num(regionDraft.lng) == null ||
+                    num(regionDraft.radius) == null
+                  }
+                  className="primary-btn px-5 py-2.5 disabled:opacity-50"
+                >
+                  OK
+                </button>
+              </div>
+            </aside>
           </div>
         </div>
       )}

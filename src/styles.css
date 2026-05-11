@@ -141,3 +141,35 @@ button { cursor: pointer; }
   place-items: center;
   color: rgba(148, 163, 184, .48);
 }
+
+.region-map {
+  border: 1px solid rgba(125, 180, 255, .22);
+  background: #08111e;
+  box-shadow: inset 0 1px rgba(255,255,255,.08), 0 18px 44px rgba(0,0,0,.34);
+  overflow: hidden;
+}
+
+.region-map .leaflet-control-attribution,
+.region-map .leaflet-control-zoom a {
+  background: rgba(15, 23, 42, .92);
+  color: #dbeafe;
+  border-color: rgba(148, 163, 184, .24);
+}
+
+.region-map .leaflet-control-attribution a {
+  color: #93c5fd;
+}
+
+.region-map .leaflet-control-zoom {
+  border: 1px solid rgba(148, 163, 184, .24);
+  box-shadow: 0 10px 24px rgba(0,0,0,.28);
+}
+
+.region-map .leaflet-control-zoom a:hover {
+  background: rgba(30, 41, 59, .98);
+  color: #fff;
+}
+
+.region-map .leaflet-tile-pane {
+  filter: saturate(.9) contrast(1.02) brightness(.82);
+}
