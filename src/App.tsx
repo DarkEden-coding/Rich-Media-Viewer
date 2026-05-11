@@ -1028,8 +1028,16 @@ function App() {
         filter: { media_type: "image", missing: false, limit: 500, offset: 0 },
       });
       setFaceItems(result);
-      setFaceIndex(0);
-      if (result[0]) await processFaceImage(result[0].id);
+      let foundFace = false;
+      for (let i = 0; i < result.length; i += 1) {
+        setFaceIndex(i);
+        const faceCount = await processFaceImage(result[i].id);
+        if (faceCount === null || faceCount > 0) {
+          foundFace = faceCount !== null;
+          break;
+        }
+      }
+      if (result.length && !foundFace) setNotice("No images with faces found.");
     } catch (e) {
       setNotice(`Face setup unavailable: ${String(e)}`);
     } finally {
@@ -1041,15 +1049,13 @@ function App() {
       mediaItemId: mediaId,
       personId: null,
     });
-    if (requestId !== faceRequestRef.current) return;
-    setFaces(f.filter((x) => x.media_item_id === mediaId));
+    const mediaFaces = f.filter((x) => x.media_item_id === mediaId);
+    if (requestId !== faceRequestRef.current) return mediaFaces.length;
+    setFaces(mediaFaces);
     setFaceNames(
-      Object.fromEntries(
-        f
-          .filter((x) => x.media_item_id === mediaId)
-          .map((x) => [x.id, x.person_name || ""]),
-      ),
+      Object.fromEntries(mediaFaces.map((x) => [x.id, x.person_name || ""])),
     );
+    return mediaFaces.length;
   }
   async function processFaceImage(mediaId: number) {
     const requestId = ++faceRequestRef.current;
@@ -1059,23 +1065,37 @@ function App() {
     setFaceBusy(true);
     try {
       await invoke<SidecarResult>("process_face_setup_image", { mediaId });
-      await applyFaceListForMedia(mediaId, requestId);
+      const faceCount = await applyFaceListForMedia(mediaId, requestId);
       await loadPeople();
+      return faceCount;
     } catch (e) {
       if (requestId === faceRequestRef.current) {
         setNotice(`Face processing failed: ${String(e)}`);
         setFaces([]);
         setFaceNames({});
       }
+      return null;
     } finally {
       if (requestId === faceRequestRef.current) setFaceBusy(false);
     }
   }
   async function goFace(delta: number) {
-    const next = Math.min(Math.max(faceIndex + delta, 0), faceItems.length - 1);
-    setFaceIndex(next);
-    const item = faceItems[next];
-    if (item) await processFaceImage(item.id);
+    if (!faceItems.length) return;
+
+    const step = delta >= 0 ? 1 : -1;
+    let next = Math.min(Math.max(faceIndex + step, 0), faceItems.length - 1);
+
+    while (next >= 0 && next < faceItems.length) {
+      setFaceIndex(next);
+      const item = faceItems[next];
+      const faceCount = item ? await processFaceImage(item.id) : null;
+
+      if (delta < 0 || faceCount === null || faceCount > 0) return;
+
+      next += step;
+    }
+
+    setNotice("No more images with faces found.");
   }
   async function saveFaceName(faceId: number) {
     const name = (faceNames[faceId] || "").trim();

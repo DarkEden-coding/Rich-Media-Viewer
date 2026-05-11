@@ -264,7 +264,10 @@ PRAGMA foreign_keys=ON;
 CREATE TABLE IF NOT EXISTS media_items(id INTEGER PRIMARY KEY AUTOINCREMENT,path TEXT NOT NULL UNIQUE,file_name TEXT NOT NULL,extension TEXT,media_type TEXT NOT NULL,size_bytes INTEGER,created_at INTEGER,modified_at INTEGER,imported_at INTEGER NOT NULL,missing INTEGER NOT NULL DEFAULT 0,camera_make TEXT,camera_model TEXT,latitude REAL,longitude REAL);
 CREATE INDEX IF NOT EXISTS idx_media_items_path ON media_items(path); CREATE INDEX IF NOT EXISTS idx_media_items_type ON media_items(media_type);
 CREATE TABLE IF NOT EXISTS people(id INTEGER PRIMARY KEY AUTOINCREMENT,name TEXT NOT NULL,created_at INTEGER NOT NULL);
+CREATE INDEX IF NOT EXISTS idx_people_name ON people(name COLLATE NOCASE);
 CREATE TABLE IF NOT EXISTS faces(id INTEGER PRIMARY KEY AUTOINCREMENT,media_item_id INTEGER NOT NULL,person_id INTEGER,x REAL NOT NULL,y REAL NOT NULL,width REAL NOT NULL,height REAL NOT NULL,confidence REAL,created_at INTEGER NOT NULL,FOREIGN KEY(media_item_id) REFERENCES media_items(id) ON DELETE CASCADE,FOREIGN KEY(person_id) REFERENCES people(id) ON DELETE SET NULL);
+CREATE INDEX IF NOT EXISTS idx_faces_media_item_id ON faces(media_item_id);
+CREATE INDEX IF NOT EXISTS idx_faces_person_media ON faces(person_id, media_item_id);
 CREATE TABLE IF NOT EXISTS embeddings(id INTEGER PRIMARY KEY AUTOINCREMENT,media_item_id INTEGER,face_id INTEGER,model TEXT NOT NULL,vector BLOB NOT NULL,created_at INTEGER NOT NULL,FOREIGN KEY(media_item_id) REFERENCES media_items(id) ON DELETE CASCADE,FOREIGN KEY(face_id) REFERENCES faces(id) ON DELETE CASCADE);
 CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY,value TEXT NOT NULL,updated_at INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS library_folders(id INTEGER PRIMARY KEY AUTOINCREMENT,path TEXT NOT NULL UNIQUE,created_at INTEGER NOT NULL);
@@ -278,6 +281,10 @@ CREATE TABLE IF NOT EXISTS library_folders(id INTEGER PRIMARY KEY AUTOINCREMENT,
     }
     let _ = conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_media_items_captured ON media_items(captured_at)",
+        [],
+    );
+    let _ = conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_media_items_sort_date ON media_items(COALESCE(captured_at,modified_at,created_at), id)",
         [],
     );
     Ok(())
@@ -1148,14 +1155,18 @@ fn search_media(app: tauri::AppHandle, filter: SearchFilter) -> Result<Vec<Media
         _ => None,
     };
     if filter.person_id.is_some() || filter.person_name.is_some() {
-        sql.push_str(" AND EXISTS(SELECT 1 FROM faces f LEFT JOIN people p ON p.id=f.person_id WHERE f.media_item_id=media_items.id");
+        sql.push_str(" AND media_items.id IN (SELECT DISTINCT f.media_item_id FROM faces f");
+        if filter.person_name.is_some() {
+            sql.push_str(" JOIN people p ON p.id=f.person_id");
+        }
+        sql.push_str(" WHERE 1=1");
         if let Some(id) = filter.person_id {
             sql.push_str(" AND f.person_id=?");
             v.push(Box::new(id));
         }
         if let Some(n) = filter.person_name {
-            sql.push_str(" AND p.name LIKE ?");
-            v.push(Box::new(format!("%{}%", n)));
+            sql.push_str(" AND p.name LIKE ? COLLATE NOCASE");
+            v.push(Box::new(format!("%{}%", n.trim())));
         }
         sql.push(')');
     }
