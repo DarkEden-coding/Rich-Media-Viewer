@@ -81,8 +81,65 @@ type GeoPoint = {
   latitude: number;
   longitude: number;
 };
+type CleanupEntry = {
+  path: string;
+  size_bytes: number | null;
+  reason: string;
+};
+type CleanupCandidate = {
+  path: string;
+  display_path: string | null;
+  file_name: string;
+  size_bytes: number | null;
+  created_at: number | null;
+  modified_at: number | null;
+  captured_at: number | null;
+  width: number | null;
+  height: number | null;
+};
+type CleanupDuplicateGroup = {
+  id: string;
+  kind: string;
+  reason: string;
+  score: number | null;
+  default_keep_path: string;
+  candidates: CleanupCandidate[];
+};
+type CleanupPlan = {
+  plan_id: string;
+  ignored_files: CleanupEntry[];
+  empty_folders: CleanupEntry[];
+  duplicate_groups: CleanupDuplicateGroup[];
+  totals: {
+    ignored_files: number;
+    empty_folders: number;
+    duplicate_groups: number;
+    duplicate_files: number;
+    selected_files: number;
+    selected_folders: number;
+    selected_bytes: number;
+    errors: number;
+  };
+  errors: string[];
+};
+type CleanupProgress = {
+  phase: string;
+  current_path: string | null;
+  processed: number;
+  total: number | null;
+  errors: number;
+  done: boolean;
+};
+type ApplyCleanupResult = {
+  files_deleted: number;
+  folders_deleted: number;
+  bytes_deleted: number;
+  rows_marked_missing: number;
+  errors: string[];
+};
 type ViewMode = "grid" | "list";
 type SortOrder = "desc" | "asc";
+type CleanupTab = "summary" | "ignored" | "folders" | "exact" | "visual";
 
 const emptyFilters = {
   fileNameQuery: "",
@@ -436,9 +493,21 @@ function scanProgressNotice(p: ScanProgress) {
       : "";
   return `${p.phase}: ${p.scanned_files} scanned, ${p.imported_or_updated} imported${faceLine}`;
 }
+function cleanupProgressNotice(p: CleanupProgress) {
+  const total = p.total != null ? ` / ${p.total}` : "";
+  return `${p.phase}: ${p.processed}${total}${p.errors ? `, ${p.errors} errors` : ""}`;
+}
 function formatCoord(value: string, fallback = "Not set") {
   const n = Number(value);
   return value.trim() === "" || Number.isNaN(n) ? fallback : n.toFixed(4);
+}
+function candidateDate(candidate: CleanupCandidate) {
+  return candidate.captured_at ?? candidate.modified_at ?? candidate.created_at ?? null;
+}
+function candidateResolution(candidate: CleanupCandidate) {
+  return candidate.width && candidate.height
+    ? `${candidate.width}×${candidate.height}`
+    : "Unknown resolution";
 }
 
 function EarthRegionMap({
@@ -655,6 +724,12 @@ function App() {
   const [loading, setLoading] = useState(false);
   const [scan, setScan] = useState<ScanSummary | null>(null);
   const [scanProgress, setScanProgress] = useState<ScanProgress | null>(null);
+  const [cleanupOpen, setCleanupOpen] = useState(false);
+  const [cleanupPlan, setCleanupPlan] = useState<CleanupPlan | null>(null);
+  const [cleanupProgress, setCleanupProgress] = useState<CleanupProgress | null>(null);
+  const [cleanupTab, setCleanupTab] = useState<CleanupTab>("summary");
+  const [cleanupKeepers, setCleanupKeepers] = useState<Record<string, string>>({});
+  const [cleanupApplying, setCleanupApplying] = useState(false);
   const [semanticSearchOverlayVisible, setSemanticSearchOverlayVisible] =
     useState(false);
   const [notice, setNotice] = useState("Starting Rich Media Viewer…");
@@ -972,6 +1047,15 @@ function App() {
     };
   }, []);
   useEffect(() => {
+    const unlisten = listen<CleanupProgress>("cleanup-progress", (e) => {
+      setCleanupProgress(e.payload);
+      setNotice(cleanupProgressNotice(e.payload));
+    });
+    return () => {
+      unlisten.then((f) => f());
+    };
+  }, []);
+  useEffect(() => {
     if (!faceSetupOpen) return;
     const updateFaceImageRect = () => {
       const image = faceImageRef.current;
@@ -1089,6 +1173,114 @@ function App() {
     } finally {
       setLoading(false);
       setScanProgress(null);
+    }
+  }
+  async function openCleanup() {
+    if (!folders.length) {
+      setNotice("Add at least one library folder before cleaning files.");
+      return;
+    }
+    setCleanupOpen(true);
+    setCleanupTab("summary");
+    setCleanupPlan(null);
+    setCleanupKeepers({});
+    setCleanupProgress({
+      phase: "Starting cleanup plan",
+      current_path: null,
+      processed: 0,
+      total: null,
+      errors: 0,
+      done: false,
+    });
+    setLoading(true);
+    try {
+      const plan = await invoke<CleanupPlan>("generate_cleanup_plan", {
+        paths: folders,
+      });
+      setCleanupPlan(plan);
+      setCleanupKeepers(
+        Object.fromEntries(
+          plan.duplicate_groups.map((group) => [
+            group.id,
+            group.default_keep_path,
+          ]),
+        ),
+      );
+      setNotice(
+        `Cleanup plan ready: ${plan.totals.selected_files} files selected`,
+      );
+    } catch (e) {
+      setNotice(`Cleanup plan failed: ${String(e)}`);
+      setCleanupOpen(false);
+    } finally {
+      setLoading(false);
+      setCleanupProgress(null);
+    }
+  }
+  async function closeCleanup() {
+    if (cleanupPlan) {
+      try {
+        await invoke("cancel_cleanup_plan", { planId: cleanupPlan.plan_id });
+      } catch {
+        /* best effort */
+      }
+    }
+    setCleanupOpen(false);
+    setCleanupPlan(null);
+    setCleanupProgress(null);
+    setCleanupKeepers({});
+  }
+  function selectedCleanupPaths(plan: CleanupPlan) {
+    const ignored = plan.ignored_files.map((entry) => entry.path);
+    const duplicates = plan.duplicate_groups.flatMap((group) => {
+      const keep = cleanupKeepers[group.id] || group.default_keep_path;
+      return group.candidates
+        .filter((candidate) => candidate.path !== keep)
+        .map((candidate) => candidate.path);
+    });
+    return Array.from(new Set([...ignored, ...duplicates]));
+  }
+  function selectedCleanupBytes(plan: CleanupPlan) {
+    const selected = new Set(selectedCleanupPaths(plan));
+    const ignoredBytes = plan.ignored_files
+      .filter((entry) => selected.has(entry.path))
+      .reduce((sum, entry) => sum + (entry.size_bytes ?? 0), 0);
+    const duplicateBytes = plan.duplicate_groups
+      .flatMap((group) => group.candidates)
+      .filter((candidate) => selected.has(candidate.path))
+      .reduce((sum, candidate) => sum + (candidate.size_bytes ?? 0), 0);
+    return ignoredBytes + duplicateBytes;
+  }
+  async function applyCleanup() {
+    if (!cleanupPlan) return;
+    const removePaths = selectedCleanupPaths(cleanupPlan);
+    const emptyFolders = cleanupPlan.empty_folders.map((entry) => entry.path);
+    if (
+      !confirm(
+        `Move ${removePaths.length} file(s) and ${emptyFolders.length} folder(s) to the Recycle Bin? This uses the OS Recycle Bin, not permanent deletion.`,
+      )
+    )
+      return;
+    setCleanupApplying(true);
+    setLoading(true);
+    try {
+      const result = await invoke<ApplyCleanupResult>("apply_cleanup_plan", {
+        planId: cleanupPlan.plan_id,
+        selections: { remove_paths: removePaths, empty_folders: emptyFolders },
+      });
+      setCleanupOpen(false);
+      setCleanupPlan(null);
+      setCleanupKeepers({});
+      await runSearch();
+      setNotice(
+        `Cleanup complete: ${result.files_deleted} files and ${result.folders_deleted} folders recycled${result.errors.length ? `, ${result.errors.length} error(s)` : ""}.`,
+      );
+    } catch (e) {
+      setNotice(`Cleanup failed: ${String(e)}`);
+    } finally {
+      setCleanupApplying(false);
+      setLoading(false);
+      setCleanupProgress(null);
     }
   }
   async function deleteIndex() {
@@ -1509,6 +1701,15 @@ function App() {
               </p>
             </div>
             <div className="flex shrink-0 flex-wrap items-center gap-2">
+              <button
+                type="button"
+                onClick={openCleanup}
+                disabled={loading || cleanupApplying || !folders.length}
+                className="rounded-lg border border-amber-300/40 bg-amber-400/10 px-4 py-2.5 text-[15px] font-bold text-amber-100 hover:bg-amber-400/20 disabled:opacity-50"
+                title="Review ignored files, empty folders, and duplicate images before moving them to the Recycle Bin"
+              >
+                Clean Files
+              </button>
               <div className="glass-panel rounded-lg p-1 flex items-center">
                 <button
                   type="button"
@@ -2182,6 +2383,299 @@ function App() {
                 </button>
               </div>
             </aside>
+          </div>
+        </div>
+      )}
+      {cleanupOpen && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/85 p-4"
+          onClick={closeCleanup}
+        >
+          <div
+            onClick={(e) => e.stopPropagation()}
+            className="glass-panel flex max-h-[94vh] w-full max-w-7xl flex-col overflow-hidden rounded-2xl"
+          >
+            <div className="flex items-center justify-between gap-4 border-b border-white/10 p-5">
+              <div className="min-w-0">
+                <p className="text-xs font-black uppercase tracking-[0.28em] text-amber-300">
+                  File Cleaner
+                </p>
+                <h2 className="mt-1 text-2xl font-black">
+                  Review cleanup plan
+                </h2>
+                <p className="mt-1 truncate text-sm text-slate-400">
+                  Files are moved to the OS Recycle Bin only after this review.
+                </p>
+              </div>
+              <button
+                onClick={closeCleanup}
+                disabled={cleanupApplying}
+                className="rounded-lg px-3 py-2 text-slate-400 hover:bg-white/10 hover:text-white disabled:opacity-50"
+              >
+                ✕
+              </button>
+            </div>
+            {cleanupProgress && (
+              <div className="border-b border-amber-300/10 bg-amber-400/10 px-5 py-3 text-sm text-amber-100">
+                <div className="mb-2 flex justify-between">
+                  <span>{cleanupProgress.phase}</span>
+                  <span>
+                    {cleanupProgress.processed}
+                    {cleanupProgress.total != null
+                      ? ` / ${cleanupProgress.total}`
+                      : ""}
+                  </span>
+                </div>
+                <div className="h-2 overflow-hidden rounded-full bg-slate-950">
+                  <div
+                    className="h-full rounded-full bg-amber-300"
+                    style={{
+                      width: cleanupProgress.total
+                        ? `${Math.min(100, (cleanupProgress.processed / cleanupProgress.total) * 100)}%`
+                        : "35%",
+                    }}
+                  />
+                </div>
+              </div>
+            )}
+            {cleanupPlan ? (
+              <>
+                <div className="grid gap-3 border-b border-white/10 p-4 text-sm sm:grid-cols-5">
+                  <div className="rounded-lg bg-slate-950/40 p-3">
+                    <p className="text-slate-500">Selected Files</p>
+                    <p className="text-2xl font-black">
+                      {selectedCleanupPaths(cleanupPlan).length}
+                    </p>
+                  </div>
+                  <div className="rounded-lg bg-slate-950/40 p-3">
+                    <p className="text-slate-500">Selected Size</p>
+                    <p className="text-2xl font-black">
+                      {formatBytes(selectedCleanupBytes(cleanupPlan))}
+                    </p>
+                  </div>
+                  <div className="rounded-lg bg-slate-950/40 p-3">
+                    <p className="text-slate-500">Duplicate Groups</p>
+                    <p className="text-2xl font-black">
+                      {cleanupPlan.totals.duplicate_groups}
+                    </p>
+                  </div>
+                  <div className="rounded-lg bg-slate-950/40 p-3">
+                    <p className="text-slate-500">Empty Folders</p>
+                    <p className="text-2xl font-black">
+                      {cleanupPlan.totals.empty_folders}
+                    </p>
+                  </div>
+                  <div className="rounded-lg bg-slate-950/40 p-3">
+                    <p className="text-slate-500">Errors</p>
+                    <p className="text-2xl font-black">
+                      {cleanupPlan.errors.length}
+                    </p>
+                  </div>
+                </div>
+                <div className="flex flex-wrap gap-2 border-b border-white/10 p-3">
+                  {[
+                    ["summary", "Summary"],
+                    ["ignored", `Ignored (${cleanupPlan.ignored_files.length})`],
+                    ["folders", `Folders (${cleanupPlan.empty_folders.length})`],
+                    [
+                      "exact",
+                      `Exact (${cleanupPlan.duplicate_groups.filter((g) => g.kind === "exact-image").length})`,
+                    ],
+                    [
+                      "visual",
+                      `Visual (${cleanupPlan.duplicate_groups.filter((g) => g.kind === "visual-image").length})`,
+                    ],
+                  ].map(([id, label]) => (
+                    <button
+                      key={id}
+                      type="button"
+                      onClick={() => setCleanupTab(id as CleanupTab)}
+                      className={`rounded-lg px-4 py-2 text-sm font-bold ${
+                        cleanupTab === id
+                          ? "bg-amber-300 text-slate-950"
+                          : "bg-white/5 text-slate-300 hover:bg-white/10"
+                      }`}
+                    >
+                      {label}
+                    </button>
+                  ))}
+                </div>
+                <div className="min-h-0 flex-1 overflow-y-auto p-4">
+                  {cleanupTab === "summary" && (
+                    <div className="space-y-3 text-sm text-slate-300">
+                      <p>
+                        The current selection will move ignored files and
+                        duplicate non-keepers to the Recycle Bin. Empty folders
+                        are checked again after file cleanup.
+                      </p>
+                      {cleanupPlan.errors.length > 0 && (
+                        <div className="rounded-lg border border-red-400/25 bg-red-500/10 p-3 text-red-100">
+                          <p className="mb-2 font-bold">Plan errors</p>
+                          {cleanupPlan.errors.slice(0, 12).map((error, i) => (
+                            <p key={i} className="truncate font-mono text-xs">
+                              {error}
+                            </p>
+                          ))}
+                        </div>
+                      )}
+                    </div>
+                  )}
+                  {cleanupTab === "ignored" && (
+                    <div className="space-y-2">
+                      {cleanupPlan.ignored_files.map((entry) => (
+                        <div
+                          key={entry.path}
+                          className="rounded-lg border border-white/10 bg-slate-950/35 p-3 text-sm"
+                        >
+                          <div className="flex justify-between gap-4">
+                            <p className="truncate font-mono text-slate-200">
+                              {entry.path}
+                            </p>
+                            <p className="shrink-0 text-slate-400">
+                              {formatBytes(entry.size_bytes)}
+                            </p>
+                          </div>
+                          <p className="mt-1 text-xs text-slate-500">
+                            {entry.reason}
+                          </p>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                  {cleanupTab === "folders" && (
+                    <div className="space-y-2">
+                      {cleanupPlan.empty_folders.map((entry) => (
+                        <div
+                          key={entry.path}
+                          className="rounded-lg border border-white/10 bg-slate-950/35 p-3 text-sm"
+                        >
+                          <p className="truncate font-mono text-slate-200">
+                            {entry.path}
+                          </p>
+                          <p className="mt-1 text-xs text-slate-500">
+                            {entry.reason}
+                          </p>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                  {(cleanupTab === "exact" || cleanupTab === "visual") && (
+                    <div className="space-y-4">
+                      {cleanupPlan.duplicate_groups
+                        .filter((group) =>
+                          cleanupTab === "exact"
+                            ? group.kind === "exact-image"
+                            : group.kind === "visual-image",
+                        )
+                        .map((group) => {
+                          const keep =
+                            cleanupKeepers[group.id] || group.default_keep_path;
+                          return (
+                            <section
+                              key={group.id}
+                              className="rounded-xl border border-white/10 bg-slate-950/30 p-3"
+                            >
+                              <div className="mb-3 flex flex-wrap items-center justify-between gap-2 text-sm">
+                                <p className="font-bold text-slate-100">
+                                  {group.reason}
+                                  {group.score != null &&
+                                    group.kind === "visual-image" &&
+                                    ` · distance ${group.score}`}
+                                </p>
+                                <p className="text-xs text-slate-500">
+                                  Keeping one of {group.candidates.length}
+                                </p>
+                              </div>
+                              <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-3">
+                                {group.candidates.map((candidate) => {
+                                  const isKeep = candidate.path === keep;
+                                  return (
+                                    <button
+                                      key={candidate.path}
+                                      type="button"
+                                      onClick={() =>
+                                        setCleanupKeepers((prev) => ({
+                                          ...prev,
+                                          [group.id]: candidate.path,
+                                        }))
+                                      }
+                                      className={`overflow-hidden rounded-lg border text-left ${
+                                        isKeep
+                                          ? "border-emerald-300 bg-emerald-400/10"
+                                          : "border-red-300/25 bg-red-500/5"
+                                      }`}
+                                    >
+                                      <img
+                                        src={fileUrl(
+                                          candidate.display_path ||
+                                            candidate.path,
+                                        )}
+                                        className="h-36 w-full bg-black object-cover"
+                                        loading="lazy"
+                                      />
+                                      <div className="space-y-1 p-3 text-xs">
+                                        <p
+                                          className={`font-black ${
+                                            isKeep
+                                              ? "text-emerald-200"
+                                              : "text-red-200"
+                                          }`}
+                                        >
+                                          {isKeep ? "Keep" : "Recycle"}
+                                        </p>
+                                        <p className="truncate font-semibold text-slate-100">
+                                          {candidate.file_name}
+                                        </p>
+                                        <p className="text-slate-400">
+                                          {formatBytes(candidate.size_bytes)} ·{" "}
+                                          {candidateResolution(candidate)}
+                                        </p>
+                                        <p className="text-slate-500">
+                                          {formatDate(candidateDate(candidate))}
+                                        </p>
+                                        <p className="truncate font-mono text-slate-600">
+                                          {candidate.path}
+                                        </p>
+                                      </div>
+                                    </button>
+                                  );
+                                })}
+                              </div>
+                            </section>
+                          );
+                        })}
+                    </div>
+                  )}
+                </div>
+                <div className="flex flex-wrap items-center justify-end gap-3 border-t border-white/10 p-4">
+                  <button
+                    type="button"
+                    onClick={closeCleanup}
+                    disabled={cleanupApplying}
+                    className="rounded-lg px-4 py-2.5 font-bold text-slate-300 hover:bg-white/10 hover:text-white disabled:opacity-50"
+                  >
+                    Cancel
+                  </button>
+                  <button
+                    type="button"
+                    onClick={applyCleanup}
+                    disabled={cleanupApplying}
+                    className="primary-btn px-5 py-2.5 disabled:opacity-50"
+                  >
+                    {cleanupApplying
+                      ? "Cleaning…"
+                      : "Yes, Current Selection Is Good"}
+                  </button>
+                </div>
+              </>
+            ) : (
+              <div className="flex min-h-[360px] flex-col items-center justify-center gap-4 p-8 text-center">
+                <div className="h-12 w-12 animate-spin rounded-full border-2 border-amber-300/25 border-t-amber-300" />
+                <p className="text-sm font-semibold text-slate-200">
+                  Generating cleanup plan
+                </p>
+              </div>
+            )}
           </div>
         </div>
       )}

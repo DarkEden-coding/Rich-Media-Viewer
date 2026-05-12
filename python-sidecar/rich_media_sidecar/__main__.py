@@ -10,6 +10,7 @@ from typing import Any
 import numpy as np
 
 from .clustering import cosine
+from .cleanup import fingerprint_paths
 from .heic import convert_heic_paths
 from .insightface_engine import cluster_paths as insightface_cluster_paths
 from .insightface_engine import handle_face_match_request
@@ -74,6 +75,10 @@ def build_parser() -> argparse.ArgumentParser:
     ch.add_argument("paths", nargs="*", type=Path)
     ch.add_argument("--cache-dir", type=Path, default=None)
     ch.add_argument("--json", dest="json_payload", help="JSON request: {paths:[], cache_dir:string}")
+
+    vf = sub.add_parser("visual-fingerprints", help="Compute local image dimensions and perceptual hashes")
+    vf.add_argument("paths", nargs="*", type=Path)
+    vf.add_argument("--json", dest="json_payload", help="JSON request: {paths:[]}")
 
     m = sub.add_parser("embedding-models", help="List common embedding models by provider")
 
@@ -150,6 +155,11 @@ def main(argv: list[str] | None = None) -> int:
                 raise ValueError("convert-heic requires --cache-dir or cache_dir in --json")
             conversions = convert_heic_paths(paths, Path(cache_dir_value))
             write_ok({"conversions": conversions})
+            return 0
+        if args.command == "visual-fingerprints":
+            payload = _payload(args.json_payload)
+            paths = [Path(p) for p in payload.get("paths", [])] + list(args.paths)
+            write_ok(fingerprint_paths(paths))
             return 0
         if args.command == "serve-faces":
             return serve_faces(float(args.threshold))
