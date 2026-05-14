@@ -1635,6 +1635,10 @@ fn cleanup_image_items(
     enrich_display_paths(app, &mut items)?;
     Ok(items)
 }
+fn path_is_under_roots(path: &str, roots: &[String]) -> bool {
+    let path = Path::new(path);
+    roots.iter().any(|root| path.starts_with(Path::new(root)))
+}
 fn hex_hamming(a: &str, b: &str) -> Option<i64> {
     let x = u128::from_str_radix(a, 16).ok()?;
     let y = u128::from_str_radix(b, 16).ok()?;
@@ -1672,6 +1676,23 @@ struct CleanupCacheUpdate {
     ahash: Option<String>,
     dhash: Option<String>,
     phash: Option<String>,
+}
+#[derive(Debug, Serialize)]
+struct CleanupCacheInfo {
+    total_entries: i64,
+    exact_hash_entries: i64,
+    visual_fingerprint_entries: i64,
+    complete_entries: i64,
+    selected_images: usize,
+    selected_exact_cached: usize,
+    selected_visual_cached: usize,
+    selected_complete_cached: usize,
+    selected_uncached_exact: usize,
+    selected_uncached_visual: usize,
+    stale_selected_entries: usize,
+    cache_bytes_estimate: i64,
+    oldest_updated_at: Option<i64>,
+    newest_updated_at: Option<i64>,
 }
 fn load_cleanup_file_cache(conn: &Connection) -> Result<HashMap<String, CleanupFileCache>, String> {
     let mut stmt = conn
@@ -1721,11 +1742,11 @@ fn write_cleanup_cache_updates(
                      size_bytes=excluded.size_bytes,
                      modified_at=excluded.modified_at,
                      sha256=excluded.sha256,
-                     width=NULL,
-                     height=NULL,
-                     ahash=NULL,
-                     dhash=NULL,
-                     phash=NULL,
+                     width=cleanup_file_cache.width,
+                     height=cleanup_file_cache.height,
+                     ahash=cleanup_file_cache.ahash,
+                     dhash=cleanup_file_cache.dhash,
+                     phash=cleanup_file_cache.phash,
                      updated_at=excluded.updated_at"#,
                 params![
                     update.path,
@@ -1743,6 +1764,7 @@ fn write_cleanup_cache_updates(
                    ON CONFLICT(path) DO UPDATE SET
                      size_bytes=excluded.size_bytes,
                      modified_at=excluded.modified_at,
+                     sha256=cleanup_file_cache.sha256,
                      width=excluded.width,
                      height=excluded.height,
                      ahash=excluded.ahash,
@@ -2048,7 +2070,10 @@ fn generate_cleanup_plan_impl(
     }
     let mut conn = open_db(&app)?;
     let cleanup_cache = load_cleanup_file_cache(&conn)?;
-    let image_items = cleanup_image_items(&conn, &app)?;
+    let image_items: Vec<MediaItem> = cleanup_image_items(&conn, &app)?
+        .into_iter()
+        .filter(|item| path_is_under_roots(&item.path, &roots))
+        .collect();
     emit_cleanup_progress(
         &app,
         &format!(
@@ -2253,6 +2278,110 @@ async fn generate_cleanup_plan(
 }
 
 #[tauri::command]
+fn get_cleanup_cache_info(
+    app: tauri::AppHandle,
+    paths: Option<Vec<String>>,
+) -> Result<CleanupCacheInfo, String> {
+    let roots = if let Some(paths) = paths.filter(|p| !p.is_empty()) {
+        paths
+    } else {
+        list_library_folders(app.clone())?
+    };
+    let conn = open_db(&app)?;
+    let cleanup_cache = load_cleanup_file_cache(&conn)?;
+    let mut stmt = conn
+        .prepare(
+            r#"SELECT
+                COUNT(*),
+                SUM(CASE WHEN sha256 IS NOT NULL THEN 1 ELSE 0 END),
+                SUM(CASE WHEN ahash IS NOT NULL AND dhash IS NOT NULL AND phash IS NOT NULL THEN 1 ELSE 0 END),
+                SUM(CASE WHEN sha256 IS NOT NULL AND ahash IS NOT NULL AND dhash IS NOT NULL AND phash IS NOT NULL THEN 1 ELSE 0 END),
+                SUM(LENGTH(path) + COALESCE(LENGTH(sha256),0) + COALESCE(LENGTH(ahash),0) + COALESCE(LENGTH(dhash),0) + COALESCE(LENGTH(phash),0) + 64),
+                MIN(updated_at),
+                MAX(updated_at)
+               FROM cleanup_file_cache"#,
+        )
+        .map_err(|e| e.to_string())?;
+    let (
+        total_entries,
+        exact_hash_entries,
+        visual_fingerprint_entries,
+        complete_entries,
+        cache_bytes_estimate,
+        oldest_updated_at,
+        newest_updated_at,
+    ) = stmt
+        .query_row([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, Option<i64>>(1)?.unwrap_or(0),
+                row.get::<_, Option<i64>>(2)?.unwrap_or(0),
+                row.get::<_, Option<i64>>(3)?.unwrap_or(0),
+                row.get::<_, Option<i64>>(4)?.unwrap_or(0),
+                row.get::<_, Option<i64>>(5)?,
+                row.get::<_, Option<i64>>(6)?,
+            ))
+        })
+        .map_err(|e| e.to_string())?;
+    let image_items: Vec<MediaItem> = cleanup_image_items(&conn, &app)?
+        .into_iter()
+        .filter(|item| path_is_under_roots(&item.path, &roots))
+        .collect();
+    let mut selected_exact_cached = 0usize;
+    let mut selected_visual_cached = 0usize;
+    let mut selected_complete_cached = 0usize;
+    let mut stale_selected_entries = 0usize;
+    for item in &image_items {
+        if let Some(cache) = cleanup_cache.get(&item.path) {
+            if cache_matches_media(cache, item) {
+                let exact = cache.sha256.is_some();
+                let visual = cache.width.is_some()
+                    && cache.height.is_some()
+                    && cache.ahash.is_some()
+                    && cache.dhash.is_some()
+                    && cache.phash.is_some();
+                if exact {
+                    selected_exact_cached += 1;
+                }
+                if visual {
+                    selected_visual_cached += 1;
+                }
+                if exact && visual {
+                    selected_complete_cached += 1;
+                }
+            } else {
+                stale_selected_entries += 1;
+            }
+        }
+    }
+    Ok(CleanupCacheInfo {
+        total_entries,
+        exact_hash_entries,
+        visual_fingerprint_entries,
+        complete_entries,
+        selected_images: image_items.len(),
+        selected_exact_cached,
+        selected_visual_cached,
+        selected_complete_cached,
+        selected_uncached_exact: image_items.len().saturating_sub(selected_exact_cached),
+        selected_uncached_visual: image_items.len().saturating_sub(selected_visual_cached),
+        stale_selected_entries,
+        cache_bytes_estimate,
+        oldest_updated_at,
+        newest_updated_at,
+    })
+}
+
+#[tauri::command]
+fn clear_cleanup_cache(app: tauri::AppHandle) -> Result<usize, String> {
+    let conn = open_db(&app)?;
+    let deleted = conn
+        .execute("DELETE FROM cleanup_file_cache", [])
+        .map_err(|e| format!("failed to clear cleanup cache: {e}"))?;
+    Ok(deleted)
+}
+
+#[tauri::command]
 fn cancel_cleanup_plan(plan_id: String) -> Result<(), String> {
     cleanup_plans()
         .lock()
@@ -2310,7 +2439,7 @@ async fn apply_cleanup_plan(
         for (i, path) in selections.remove_paths.iter().enumerate() {
             emit_cleanup_progress(
                 &app,
-                "Moving files to Recycle Bin",
+                "Permanently deleting files",
                 Some(path.clone()),
                 i + 1,
                 Some(total),
@@ -2323,12 +2452,14 @@ async fn apply_cleanup_plan(
                     .push(format!("refusing unplanned file deletion: {path}"));
                 continue;
             };
-            match trash::delete(path) {
+            match fs::remove_file(path) {
                 Ok(_) => {
                     result.files_deleted += 1;
                     result.bytes_deleted += size;
                 }
-                Err(e) => result.errors.push(format!("failed to recycle {path}: {e}")),
+                Err(e) => result
+                    .errors
+                    .push(format!("failed to permanently delete {path}: {e}")),
             }
         }
         let mut folders = selections.empty_folders.clone();
@@ -2343,11 +2474,11 @@ async fn apply_cleanup_plan(
             match fs::read_dir(&folder) {
                 Ok(mut rd) => {
                     if rd.next().is_none() {
-                        match trash::delete(&folder) {
+                        match fs::remove_dir(&folder) {
                             Ok(_) => result.folders_deleted += 1,
                             Err(e) => result
                                 .errors
-                                .push(format!("failed to recycle folder {folder}: {e}")),
+                                .push(format!("failed to permanently delete folder {folder}: {e}")),
                         }
                     } else {
                         result
@@ -2828,6 +2959,11 @@ fn sidecar_command(dir: &Path) -> Command {
         .arg("rich_media_sidecar")
         .current_dir(dir)
         .env("PYTHONPATH", dir.to_string_lossy().to_string());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x08000000); // CREATE_NO_WINDOW
+    }
     command
 }
 fn run_sidecar(args: Vec<String>) -> Result<SidecarResult, String> {
@@ -3732,7 +3868,9 @@ pub fn run() {
             list_geo_points,
             generate_cleanup_plan,
             apply_cleanup_plan,
-            cancel_cleanup_plan
+            cancel_cleanup_plan,
+            get_cleanup_cache_info,
+            clear_cleanup_cache
         ])
         .run(tauri::generate_context!())
         .expect("error while running Tauri application");

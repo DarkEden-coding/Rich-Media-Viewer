@@ -130,6 +130,22 @@ type CleanupProgress = {
   errors: number;
   done: boolean;
 };
+type CleanupCacheInfo = {
+  total_entries: number;
+  exact_hash_entries: number;
+  visual_fingerprint_entries: number;
+  complete_entries: number;
+  selected_images: number;
+  selected_exact_cached: number;
+  selected_visual_cached: number;
+  selected_complete_cached: number;
+  selected_uncached_exact: number;
+  selected_uncached_visual: number;
+  stale_selected_entries: number;
+  cache_bytes_estimate: number;
+  oldest_updated_at: number | null;
+  newest_updated_at: number | null;
+};
 type ApplyCleanupResult = {
   files_deleted: number;
   folders_deleted: number;
@@ -419,31 +435,11 @@ function fileUrl(path: string) {
   try {
     return convertFileSrc(path);
   } catch {
-    return `file://${path}`;
+    return `file:///${path.replace(/\\/g, "/")}`;
   }
 }
 function mediaUrl(item: MediaItem) {
   return fileUrl(item.display_path || item.path);
-}
-function videoMimeType(item: MediaItem) {
-  switch (item.extension?.toLowerCase()) {
-    case "mp4":
-    case "m4v":
-      return "video/mp4";
-    case "webm":
-      return "video/webm";
-    case "ogv":
-    case "ogg":
-      return "video/ogg";
-    case "mov":
-      return "video/quicktime";
-    case "mkv":
-      return "video/x-matroska";
-    case "avi":
-      return "video/x-msvideo";
-    default:
-      return undefined;
-  }
 }
 function videoPreviewUrl(item: MediaItem) {
   return `${mediaUrl(item)}#t=0.001`;
@@ -725,11 +721,16 @@ function App() {
   const [scan, setScan] = useState<ScanSummary | null>(null);
   const [scanProgress, setScanProgress] = useState<ScanProgress | null>(null);
   const [cleanupOpen, setCleanupOpen] = useState(false);
+  const [cleanupCacheOpen, setCleanupCacheOpen] = useState(false);
+  const [cleanupCacheInfo, setCleanupCacheInfo] =
+    useState<CleanupCacheInfo | null>(null);
+  const [cleanupCacheInfoLoading, setCleanupCacheInfoLoading] = useState(false);
   const [cleanupPlan, setCleanupPlan] = useState<CleanupPlan | null>(null);
   const [cleanupProgress, setCleanupProgress] = useState<CleanupProgress | null>(null);
   const [cleanupTab, setCleanupTab] = useState<CleanupTab>("summary");
   const [cleanupKeepers, setCleanupKeepers] = useState<Record<string, string>>({});
   const [cleanupApplying, setCleanupApplying] = useState(false);
+  const [cleanupCacheClearing, setCleanupCacheClearing] = useState(false);
   const [semanticSearchOverlayVisible, setSemanticSearchOverlayVisible] =
     useState(false);
   const [notice, setNotice] = useState("Starting Rich Media Viewer…");
@@ -1175,12 +1176,32 @@ function App() {
       setScanProgress(null);
     }
   }
+  async function refreshCleanupCacheInfo() {
+    setCleanupCacheInfoLoading(true);
+    try {
+      setCleanupCacheInfo(
+        await invoke<CleanupCacheInfo>("get_cleanup_cache_info", {
+          paths: folders,
+        }),
+      );
+    } catch (e) {
+      setNotice(`Failed to read cleanup cache info: ${String(e)}`);
+    } finally {
+      setCleanupCacheInfoLoading(false);
+    }
+  }
   async function openCleanup() {
     if (!folders.length) {
       setNotice("Add at least one library folder before cleaning files.");
       return;
     }
+    setCleanupCacheOpen(true);
+    setCleanupCacheInfo(null);
+    await refreshCleanupCacheInfo();
+  }
+  async function rescanCleanup() {
     setCleanupOpen(true);
+    setCleanupCacheOpen(false);
     setCleanupTab("summary");
     setCleanupPlan(null);
     setCleanupKeepers({});
@@ -1212,6 +1233,8 @@ function App() {
     } catch (e) {
       setNotice(`Cleanup plan failed: ${String(e)}`);
       setCleanupOpen(false);
+      setCleanupCacheOpen(true);
+      await refreshCleanupCacheInfo();
     } finally {
       setLoading(false);
       setCleanupProgress(null);
@@ -1251,13 +1274,28 @@ function App() {
       .reduce((sum, candidate) => sum + (candidate.size_bytes ?? 0), 0);
     return ignoredBytes + duplicateBytes;
   }
+  async function clearCleanupCache() {
+    setCleanupCacheClearing(true);
+    setLoading(true);
+    try {
+      const deleted = await invoke<number>("clear_cleanup_cache");
+      setNotice(`Cleanup cache cleared: ${deleted} cached file entr${deleted === 1 ? "y" : "ies"} removed.`);
+      await refreshCleanupCacheInfo();
+    } catch (e) {
+      setNotice(`Failed to clear cleanup cache: ${String(e)}`);
+    } finally {
+      setCleanupCacheClearing(false);
+      setLoading(false);
+    }
+  }
+
   async function applyCleanup() {
     if (!cleanupPlan) return;
     const removePaths = selectedCleanupPaths(cleanupPlan);
     const emptyFolders = cleanupPlan.empty_folders.map((entry) => entry.path);
     if (
       !confirm(
-        `Move ${removePaths.length} file(s) and ${emptyFolders.length} folder(s) to the Recycle Bin? This uses the OS Recycle Bin, not permanent deletion.`,
+        `Permanently delete ${removePaths.length} file(s) and ${emptyFolders.length} folder(s)? This cannot be undone.`,
       )
     )
       return;
@@ -1273,7 +1311,7 @@ function App() {
       setCleanupKeepers({});
       await runSearch();
       setNotice(
-        `Cleanup complete: ${result.files_deleted} files and ${result.folders_deleted} folders recycled${result.errors.length ? `, ${result.errors.length} error(s)` : ""}.`,
+        `Cleanup complete: ${result.files_deleted} files and ${result.folders_deleted} folders permanently deleted${result.errors.length ? `, ${result.errors.length} error(s)` : ""}.`,
       );
     } catch (e) {
       setNotice(`Cleanup failed: ${String(e)}`);
@@ -1706,7 +1744,7 @@ function App() {
                 onClick={openCleanup}
                 disabled={loading || cleanupApplying || !folders.length}
                 className="rounded-lg border border-amber-300/40 bg-amber-400/10 px-4 py-2.5 text-[15px] font-bold text-amber-100 hover:bg-amber-400/20 disabled:opacity-50"
-                title="Review ignored files, empty folders, and duplicate images before moving them to the Recycle Bin"
+                title="Review ignored files, empty folders, and duplicate images before permanently deleting them"
               >
                 Clean Files
               </button>
@@ -2386,6 +2424,140 @@ function App() {
           </div>
         </div>
       )}
+      {cleanupCacheOpen && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/85 p-4"
+          onClick={() => !loading && setCleanupCacheOpen(false)}
+        >
+          <div
+            onClick={(e) => e.stopPropagation()}
+            className="glass-panel w-full max-w-3xl overflow-hidden rounded-2xl"
+          >
+            <div className="flex items-center justify-between gap-4 border-b border-white/10 p-5">
+              <div className="min-w-0">
+                <p className="text-xs font-black uppercase tracking-[0.28em] text-amber-300">
+                  File Cleaner
+                </p>
+                <h2 className="mt-1 text-2xl font-black">
+                  Cleanup cache
+                </h2>
+                <p className="mt-1 text-sm text-slate-400">
+                  Review cached hashes before scanning the selected folders.
+                </p>
+              </div>
+              <button
+                onClick={() => setCleanupCacheOpen(false)}
+                disabled={loading || cleanupCacheClearing}
+                className="rounded-lg px-3 py-2 text-slate-400 hover:bg-white/10 hover:text-white disabled:opacity-50"
+              >
+                x
+              </button>
+            </div>
+            <div className="space-y-4 p-5">
+              {cleanupCacheInfoLoading && !cleanupCacheInfo ? (
+                <div className="flex min-h-40 items-center justify-center">
+                  <div className="h-10 w-10 animate-spin rounded-full border-2 border-amber-300/25 border-t-amber-300" />
+                </div>
+              ) : cleanupCacheInfo ? (
+                <>
+                  <div className="grid gap-3 text-sm sm:grid-cols-4">
+                    <div className="rounded-lg bg-slate-950/40 p-3">
+                      <p className="text-slate-500">Cache Files</p>
+                      <p className="text-2xl font-black">
+                        {cleanupCacheInfo.total_entries}
+                      </p>
+                    </div>
+                    <div className="rounded-lg bg-slate-950/40 p-3">
+                      <p className="text-slate-500">Exact Hashes</p>
+                      <p className="text-2xl font-black">
+                        {cleanupCacheInfo.exact_hash_entries}
+                      </p>
+                    </div>
+                    <div className="rounded-lg bg-slate-950/40 p-3">
+                      <p className="text-slate-500">Visual Hashes</p>
+                      <p className="text-2xl font-black">
+                        {cleanupCacheInfo.visual_fingerprint_entries}
+                      </p>
+                    </div>
+                    <div className="rounded-lg bg-slate-950/40 p-3">
+                      <p className="text-slate-500">Both Cached</p>
+                      <p className="text-2xl font-black">
+                        {cleanupCacheInfo.complete_entries}
+                      </p>
+                    </div>
+                  </div>
+                  <div className="rounded-lg border border-white/10 bg-slate-950/30 p-4 text-sm text-slate-300">
+                    <div className="grid gap-3 sm:grid-cols-2">
+                      <p>
+                        Selected folder images:{" "}
+                        <span className="font-bold text-slate-100">
+                          {cleanupCacheInfo.selected_images}
+                        </span>
+                      </p>
+                      <p>
+                        Complete for selection:{" "}
+                        <span className="font-bold text-slate-100">
+                          {cleanupCacheInfo.selected_complete_cached}
+                        </span>
+                      </p>
+                      <p>
+                        Need exact hash:{" "}
+                        <span className="font-bold text-amber-200">
+                          {cleanupCacheInfo.selected_uncached_exact}
+                        </span>
+                      </p>
+                      <p>
+                        Need visual hash:{" "}
+                        <span className="font-bold text-amber-200">
+                          {cleanupCacheInfo.selected_uncached_visual}
+                        </span>
+                      </p>
+                      <p>
+                        Stale selected entries:{" "}
+                        <span className="font-bold text-slate-100">
+                          {cleanupCacheInfo.stale_selected_entries}
+                        </span>
+                      </p>
+                      <p>
+                        Estimated cache size:{" "}
+                        <span className="font-bold text-slate-100">
+                          {formatBytes(cleanupCacheInfo.cache_bytes_estimate)}
+                        </span>
+                      </p>
+                    </div>
+                    <p className="mt-3 text-xs text-slate-500">
+                      Updated {formatDate(cleanupCacheInfo.oldest_updated_at)} -{" "}
+                      {formatDate(cleanupCacheInfo.newest_updated_at)}
+                    </p>
+                  </div>
+                </>
+              ) : (
+                <p className="py-8 text-center text-sm text-slate-400">
+                  Cache information is unavailable.
+                </p>
+              )}
+            </div>
+            <div className="flex flex-wrap items-center justify-end gap-3 border-t border-white/10 p-5">
+              <button
+                type="button"
+                onClick={clearCleanupCache}
+                disabled={loading || cleanupCacheClearing}
+                className="rounded-lg border border-amber-300/30 px-4 py-2.5 font-bold text-amber-200 hover:bg-amber-300/10 disabled:opacity-50"
+              >
+                {cleanupCacheClearing ? "Clearing..." : "Clear cache"}
+              </button>
+              <button
+                type="button"
+                onClick={rescanCleanup}
+                disabled={loading || cleanupCacheClearing}
+                className="primary-btn px-5 py-2.5 disabled:opacity-50"
+              >
+                Re-scan and re-compute
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
       {cleanupOpen && (
         <div
           className="fixed inset-0 z-50 flex items-center justify-center bg-black/85 p-4"
@@ -2404,12 +2576,12 @@ function App() {
                   Review cleanup plan
                 </h2>
                 <p className="mt-1 truncate text-sm text-slate-400">
-                  Files are moved to the OS Recycle Bin only after this review.
+                  Files are permanently deleted only after this review.
                 </p>
               </div>
               <button
                 onClick={closeCleanup}
-                disabled={cleanupApplying}
+                disabled={cleanupApplying || cleanupCacheClearing}
                 className="rounded-lg px-3 py-2 text-slate-400 hover:bg-white/10 hover:text-white disabled:opacity-50"
               >
                 ✕
@@ -2504,9 +2676,9 @@ function App() {
                   {cleanupTab === "summary" && (
                     <div className="space-y-3 text-sm text-slate-300">
                       <p>
-                        The current selection will move ignored files and
-                        duplicate non-keepers to the Recycle Bin. Empty folders
-                        are checked again after file cleanup.
+                        The current selection will permanently delete ignored
+                        files and duplicate non-keepers. Empty folders are
+                        checked again after file cleanup.
                       </p>
                       {cleanupPlan.errors.length > 0 && (
                         <div className="rounded-lg border border-red-400/25 bg-red-500/10 p-3 text-red-100">
@@ -2621,7 +2793,7 @@ function App() {
                                               : "text-red-200"
                                           }`}
                                         >
-                                          {isKeep ? "Keep" : "Recycle"}
+                                          {isKeep ? "Keep" : "Delete"}
                                         </p>
                                         <p className="truncate font-semibold text-slate-100">
                                           {candidate.file_name}
@@ -2923,16 +3095,17 @@ function App() {
               {selected.media_type === "video" ? (
                 <video
                   key={selected.id}
+                  src={mediaUrl(selected)}
                   controls
                   preload="metadata"
                   playsInline
+                  onError={() =>
+                    setNotice(
+                      `Video playback failed for ${selected.file_name}. This file may use a codec unsupported by the system WebView.`,
+                    )
+                  }
                   className="max-h-[70vh] w-full rounded-2xl bg-black"
-                >
-                  <source
-                    src={mediaUrl(selected)}
-                    type={videoMimeType(selected)}
-                  />
-                </video>
+                />
               ) : (
                 <img
                   src={mediaUrl(selected)}
