@@ -394,6 +394,7 @@ CREATE TABLE IF NOT EXISTS faces(id INTEGER PRIMARY KEY AUTOINCREMENT,media_item
 CREATE INDEX IF NOT EXISTS idx_faces_media_item_id ON faces(media_item_id);
 CREATE INDEX IF NOT EXISTS idx_faces_person_media ON faces(person_id, media_item_id);
 CREATE TABLE IF NOT EXISTS embeddings(id INTEGER PRIMARY KEY AUTOINCREMENT,media_item_id INTEGER,face_id INTEGER,model TEXT NOT NULL,vector BLOB NOT NULL,created_at INTEGER NOT NULL,FOREIGN KEY(media_item_id) REFERENCES media_items(id) ON DELETE CASCADE,FOREIGN KEY(face_id) REFERENCES faces(id) ON DELETE CASCADE);
+CREATE TABLE IF NOT EXISTS media_processing_cache(media_item_id INTEGER NOT NULL,processor TEXT NOT NULL,model TEXT NOT NULL,size_bytes INTEGER,modified_at INTEGER,processed_at INTEGER NOT NULL,PRIMARY KEY(media_item_id,processor,model),FOREIGN KEY(media_item_id) REFERENCES media_items(id) ON DELETE CASCADE);
 CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY,value TEXT NOT NULL,updated_at INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS library_folders(id INTEGER PRIMARY KEY AUTOINCREMENT,path TEXT NOT NULL UNIQUE,created_at INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS cleanup_file_cache(path TEXT PRIMARY KEY,size_bytes INTEGER,modified_at INTEGER,sha256 TEXT,width INTEGER,height INTEGER,ahash TEXT,dhash TEXT,phash TEXT,updated_at INTEGER NOT NULL);
@@ -417,6 +418,22 @@ CREATE INDEX IF NOT EXISTS idx_cleanup_file_cache_fingerprint ON cleanup_file_ca
     let _ = conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_embeddings_model_media ON embeddings(model, media_item_id)",
         [],
+    );
+    let _ = conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_media_processing_cache_lookup ON media_processing_cache(processor, model, media_item_id)",
+        [],
+    );
+    let _ = conn.execute(
+        "INSERT OR IGNORE INTO media_processing_cache(media_item_id,processor,model,size_bytes,modified_at,processed_at) \
+         SELECT e.media_item_id,'embeddings',e.model,m.size_bytes,m.modified_at,e.created_at \
+         FROM embeddings e JOIN media_items m ON m.id=e.media_item_id WHERE e.media_item_id IS NOT NULL",
+        [],
+    );
+    let _ = conn.execute(
+        "INSERT OR IGNORE INTO media_processing_cache(media_item_id,processor,model,size_bytes,modified_at,processed_at) \
+         SELECT DISTINCT f.media_item_id,'faces',?1,m.size_bytes,m.modified_at,f.created_at \
+         FROM faces f JOIN media_items m ON m.id=f.media_item_id",
+        params![FACE_EMBEDDING_MODEL],
     );
     Ok(())
 }
@@ -709,6 +726,43 @@ fn sidecar_media_rows(
         })
         .collect())
 }
+fn media_rows_needing_processing(
+    conn: &Connection,
+    ids: Option<Vec<i64>>,
+    images_only: bool,
+    processor: &str,
+    model: &str,
+) -> Result<Vec<(i64, String)>, String> {
+    let rows = media_paths_for_ids(conn, ids, images_only)?;
+    let mut out = Vec::with_capacity(rows.len());
+    let mut stmt = conn
+        .prepare(
+            "SELECT 1 FROM media_processing_cache \
+             WHERE media_item_id=?1 AND processor=?2 AND model=?3 \
+             AND (size_bytes IS ?4 OR size_bytes=?4) \
+             AND (modified_at IS ?5 OR modified_at=?5)",
+        )
+        .map_err(|e| format!("failed to prepare processing cache lookup: {e}"))?;
+    for (id, path) in rows {
+        let fresh = conn
+            .query_row(
+                "SELECT size_bytes,modified_at FROM media_items WHERE id=?1",
+                params![id],
+                |r| Ok((r.get::<_, Option<i64>>(0)?, r.get::<_, Option<i64>>(1)?)),
+            )
+            .optional()
+            .map_err(|e| e.to_string())?
+            .map(|(size_bytes, modified_at)| {
+                stmt.exists(params![id, processor, model, size_bytes, modified_at])
+                    .unwrap_or(false)
+            })
+            .unwrap_or(false);
+        if !fresh {
+            out.push((id, path));
+        }
+    }
+    Ok(out)
+}
 fn haversine_km(lat1: f64, lng1: f64, lat2: f64, lng2: f64) -> f64 {
     let earth_radius_km = 6371.0088_f64;
     let dlat = (lat2 - lat1).to_radians();
@@ -992,19 +1046,6 @@ fn emit_scan_progress(
         },
     );
 }
-fn list_image_media_ids(conn: &Connection) -> Result<Vec<i64>, String> {
-    let sql = format!(
-        "SELECT id FROM media_items WHERE missing=0 AND media_type='image'{} ORDER BY id",
-        sql_path_not_blacklisted_clause()
-    );
-    let mut s = conn.prepare(&sql).map_err(|e| e.to_string())?;
-    let rows: Vec<i64> = s
-        .query_map([], |r| r.get(0))
-        .map_err(|e| e.to_string())?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|e| e.to_string())?;
-    Ok(rows)
-}
 const FACE_INDEX_BATCH: usize = 6;
 fn run_face_embedding_index_phase(
     app: &tauri::AppHandle,
@@ -1014,13 +1055,22 @@ fn run_face_embedding_index_phase(
     media_ids: Option<Vec<i64>>,
 ) -> Result<(), String> {
     let conn = open_db(app)?;
-    let media_ids = if let Some(ids) = media_ids {
-        media_paths_for_ids(&conn, Some(ids), true)?
+    let media_ids: Vec<i64> = if let Some(ids) = media_ids {
+        media_rows_needing_processing(
+            &conn,
+            Some(ids),
+            true,
+            "faces",
+            FACE_EMBEDDING_MODEL,
+        )?
             .into_iter()
             .map(|(id, _)| id)
             .collect()
     } else {
-        list_image_media_ids(&conn)?
+        media_rows_needing_processing(&conn, None, true, "faces", FACE_EMBEDDING_MODEL)?
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect()
     };
     let total_face = media_ids.len();
     let face_threads = face_indexing_thread_count();
@@ -3340,6 +3390,16 @@ fn process_face_paths(
                     tx.execute("INSERT INTO embeddings(face_id,model,vector,created_at) VALUES(?1,?2,?3,?4)",params![face_id,FACE_EMBEDDING_MODEL,vec_to_blob(&emb),now_unix()]).map_err(|e|e.to_string())?;
                 }
             }
+            for (mid, _) in &rows {
+                tx.execute(
+                    "INSERT INTO media_processing_cache(media_item_id,processor,model,size_bytes,modified_at,processed_at) \
+                     SELECT id,?2,?3,size_bytes,modified_at,?4 FROM media_items WHERE id=?1 \
+                     ON CONFLICT(media_item_id,processor,model) DO UPDATE SET \
+                     size_bytes=excluded.size_bytes,modified_at=excluded.modified_at,processed_at=excluded.processed_at",
+                    params![mid, "faces", FACE_EMBEDDING_MODEL, now_unix()],
+                )
+                .map_err(|e| format!("failed to update face processing cache: {e}"))?;
+            }
             tx.commit().map_err(|e| e.to_string())?;
         }
     }
@@ -3380,7 +3440,13 @@ fn generate_embeddings_impl(
     let selected_model = model.unwrap_or_else(|| "Qdrant/clip-ViT-B-32".into());
     let rows = sidecar_media_rows(
         &app,
-        media_paths_for_ids(&conn, media_ids, selected_provider == "fastembed")?,
+        media_rows_needing_processing(
+            &conn,
+            media_ids,
+            selected_provider == "fastembed",
+            "embeddings",
+            &selected_model,
+        )?,
     )?;
     let total = rows.len();
     let mut summary = ScanSummary::default();
@@ -3450,6 +3516,7 @@ fn generate_embeddings_impl(
             let path_to_id: HashMap<&str, i64> =
                 chunk.iter().map(|(id, p)| (p.as_str(), *id)).collect();
             let tx = conn.transaction().map_err(|e| e.to_string())?;
+            let mut processed_media_ids = HashSet::new();
             for emb in embs {
                 let src = emb
                     .get("source")
@@ -3467,20 +3534,34 @@ fn generate_embeddings_impl(
                     .and_then(|v| v.as_array())
                     .filter(|v| !v.is_empty())
                 else {
-                    skipped += 1;
                     continue;
                 };
                 let vector: Vec<f32> =
                     serde_json::from_value(serde_json::Value::Array(vecv.clone()))
                         .map_err(|e| e.to_string())?;
+                tx.execute(
+                    "DELETE FROM embeddings WHERE media_item_id=?1 AND model=?2",
+                    params![mid, model],
+                )
+                .map_err(|e| e.to_string())?;
                 tx.execute("INSERT INTO embeddings(media_item_id,model,vector,created_at) VALUES(?1,?2,?3,?4)",params![mid,model,vec_to_blob(&vector),now_unix()]).map_err(|e|e.to_string())?;
+                tx.execute(
+                    "INSERT INTO media_processing_cache(media_item_id,processor,model,size_bytes,modified_at,processed_at) \
+                     SELECT id,?2,?3,size_bytes,modified_at,?4 FROM media_items WHERE id=?1 \
+                     ON CONFLICT(media_item_id,processor,model) DO UPDATE SET \
+                     size_bytes=excluded.size_bytes,modified_at=excluded.modified_at,processed_at=excluded.processed_at",
+                    params![mid, "embeddings", selected_model, now_unix()],
+                )
+                .map_err(|e| format!("failed to update embedding processing cache: {e}"))?;
+                processed_media_ids.insert(*mid);
                 inserted += 1;
             }
+            skipped += chunk.len().saturating_sub(processed_media_ids.len());
             tx.commit().map_err(|e| e.to_string())?;
         }
         summary.scanned_files += chunk.len();
         summary.imported_or_updated = inserted;
-        summary.skipped_files = skipped + summary.scanned_files.saturating_sub(inserted + skipped);
+        summary.skipped_files = skipped;
         emit_scan_progress(
             &app,
             &summary,
